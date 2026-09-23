@@ -8,7 +8,9 @@ services:
     ports:
       - "${CATALOG_PORT}:8000"
     environment:
+      SERVICE_NAME: catalog
       LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
     networks:
       - shop
     cpus: 1.0
@@ -29,7 +31,9 @@ services:
     ports:
       - "${ORDERS_PORT}:8000"
     environment:
+      SERVICE_NAME: orders
       LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
     networks:
       - shop
     cpus: 1.0
@@ -50,7 +54,9 @@ services:
     ports:
       - "${INVENTORY_PORT}:8000"
     environment:
+      SERVICE_NAME: inventory
       LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
     networks:
       - shop
     cpus: 1.0
@@ -71,7 +77,9 @@ services:
     ports:
       - "${PAYMENTS_PORT}:8000"
     environment:
+      SERVICE_NAME: payments
       LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
     networks:
       - shop
     cpus: 1.0
@@ -92,7 +100,9 @@ services:
     ports:
       - "${BILLING_PORT}:8000"
     environment:
+      SERVICE_NAME: billing
       LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
     networks:
       - shop
     cpus: 1.0

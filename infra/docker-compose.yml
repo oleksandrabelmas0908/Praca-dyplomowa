@@ -1,0 +1,108 @@
+services:
+  catalog:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: catalog
+    ports:
+      - "${CATALOG_PORT}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  orders:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: orders
+    ports:
+      - "${ORDERS_PORT}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  inventory:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: inventory
+    ports:
+      - "${INVENTORY_PORT}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  payments:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: payments
+    ports:
+      - "${PAYMENTS_PORT}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  billing:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: billing
+    ports:
+      - "${BILLING_PORT}:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  shop:

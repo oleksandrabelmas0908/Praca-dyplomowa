@@ -1,1 +1,6 @@
 CLAUDE.md
+.env
+.venv/
+__pycache__/
+*.pyc
+bench/results/

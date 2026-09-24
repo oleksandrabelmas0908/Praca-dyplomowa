@@ -20,6 +20,7 @@ services:
       retries: 5
       start_period: 10s
 
+  # Exists only to run migrations, not part of the main application stack. It is not started by `make up` but only by `make migrate`.
   migrate:
     build:
       context: .
@@ -73,10 +74,11 @@ services:
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
-      interval: 5s
+      interval: 5m
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+      start_interval: 1s
 
   orders:
     build:
@@ -105,10 +107,11 @@ services:
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
-      interval: 5s
+      interval: 5m
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+      start_interval: 1s
 
   inventory:
     build:
@@ -137,10 +140,11 @@ services:
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
-      interval: 5s
+      interval: 5m
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+      start_interval: 1s
 
   payments:
     build:
@@ -169,10 +173,11 @@ services:
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
-      interval: 5s
+      interval: 5m
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+      start_interval: 1s
 
   billing:
     build:
@@ -201,10 +206,11 @@ services:
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
-      interval: 5s
+      interval: 5m
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+      start_interval: 1s
 
 networks:
   shop:

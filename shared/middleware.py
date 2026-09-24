@@ -2,7 +2,14 @@ import time
 from uuid import UUID, uuid4
 
 import structlog
+from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from shared.metrics import (
+    http_request_duration_seconds,
+    http_requests_in_progress,
+    http_requests_total,
+)
 
 HEADER = "x-correlation-id"
 
@@ -20,6 +27,17 @@ def read_correlation_id(scope: Scope) -> str:
     return str(uuid4())
 
 
+def endpoint_label(scope: Scope) -> str:
+    partial: str | None = None
+    for route in scope["app"].routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return route.path
+        if match == Match.PARTIAL and partial is None:
+            partial = route.path
+    return partial or "unmatched"
+
+
 class CorrelationId:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -32,6 +50,12 @@ class CorrelationId:
         correlation_id = read_correlation_id(scope)
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+
+        method = scope["method"]
+        endpoint = endpoint_label(scope)
+        measured = endpoint != "/metrics"
+        if measured:
+            http_requests_in_progress.labels(method, endpoint).inc()
 
         status = 500
         started = time.perf_counter()
@@ -49,11 +73,16 @@ class CorrelationId:
         try:
             await self.app(scope, receive, send_with_header)
         finally:
+            duration = time.perf_counter() - started
+            if measured:
+                http_requests_in_progress.labels(method, endpoint).dec()
+                http_request_duration_seconds.labels(method, endpoint).observe(duration)
+                http_requests_total.labels(method, endpoint, status).inc()
             logger.info(
                 "request",
-                method=scope["method"],
+                method=method,
                 path=scope["path"],
                 status=status,
-                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                duration_ms=round(duration * 1000, 2),
             )
             structlog.contextvars.clear_contextvars()

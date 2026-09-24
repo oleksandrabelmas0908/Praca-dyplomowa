@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     db_pool_size: int
     db_max_overflow: int
 
+    kafka_bootstrap_servers: str
+
     @field_validator("log_level", mode="before")
     @classmethod
     def uppercase(cls, value: str) -> str:

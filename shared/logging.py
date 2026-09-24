@@ -1,18 +1,18 @@
 import logging
 import sys
-from typing import Any
 
 import structlog
+from structlog.typing import EventDict, Processor
 
 
 def setup_logging(service_name: str, log_level: str) -> None:
     level = logging.getLevelNamesMapping()[log_level]
 
-    def add_service(logger: object, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    def add_service(logger: object, method_name: str, event_dict: EventDict) -> EventDict:
         event_dict["service"] = service_name
         return event_dict
 
-    shared_processors = [
+    shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         add_service,
         structlog.stdlib.add_log_level,

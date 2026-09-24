@@ -11,6 +11,13 @@ dependencies = [
     "sqlalchemy[asyncio]==2.0.54",
     "asyncpg==0.31.0",
     "alembic==1.20.0",
+    "aiokafka==0.14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.16.8",
+    "mypy==2.3.1",
 ]
 
 [build-system]
@@ -22,3 +29,14 @@ packages = ["shared"]
 
 [tool.ruff]
 line-length = 100
+# `pip install .` in the image leaves a copy of shared/ there, which would be linted twice
+extend-exclude = ["build"]
+
+[tool.mypy]
+# Without it mypy reads Settings() as missing every field that pydantic-settings fills from env
+plugins = ["pydantic.mypy"]
+
+# aiokafka has inline annotations but no py.typed marker
+[[tool.mypy.overrides]]
+module = ["aiokafka", "aiokafka.*"]
+follow_untyped_imports = true

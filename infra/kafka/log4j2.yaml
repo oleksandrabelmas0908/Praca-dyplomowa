@@ -1,0 +1,16 @@
+# Replaces the image's default log config, so Kafka writes the same JSON lines as the services
+Configuration:
+  Appenders:
+    Console:
+      name: STDOUT
+      PatternLayout:
+        pattern: >-
+          {"event": "%enc{%m}{JSON}", "service": "kafka",
+          "level": "%level{WARN=warning, FATAL=critical, lowerCase=true}",
+          "timestamp": "%d{yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'}{UTC}"%notEmpty{,
+          "exception": "%enc{%ex}{JSON}"}}%n
+  Loggers:
+    Root:
+      level: INFO
+      AppenderRef:
+        ref: STDOUT

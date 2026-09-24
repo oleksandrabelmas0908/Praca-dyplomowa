@@ -20,13 +20,43 @@ services:
       retries: 5
       start_period: 10s
 
-  # Exists only to run migrations, not part of the main application stack. It is not started by `make up` but only by `make migrate`.
+  kafka:
+    image: apache/kafka@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837  # 4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+      - ./infra/kafka/log4j2.yaml:/mnt/shared/config/log4j2.yaml:ro
+    networks:
+      - shop
+    cpus: 2.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS=-Xmx64m /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 5m
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+      start_interval: 2s
+
+  # Exists only to run migrations, not part of the main application stack. `make up` runs it once,
+  # after Postgres is healthy and before the services start.
   migrate:
     build:
       context: .
       dockerfile: infra/Dockerfile
       target: migrate
-    # Only runs through `make migrate`: the profile keeps it out of `make up`
+    # The profile keeps it out of `docker compose up`, `make up` runs it explicitly
     profiles:
       - migrate
     environment:
@@ -39,6 +69,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     cpus: 1.0
@@ -65,10 +96,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
@@ -98,10 +132,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
@@ -131,10 +168,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
@@ -164,10 +204,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
@@ -197,10 +240,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     networks:
       - shop
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
@@ -217,3 +263,4 @@ networks:
 
 volumes:
   postgres_data:
+  kafka_data:

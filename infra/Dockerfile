@@ -9,7 +9,7 @@ COPY shared/ ./shared/
 RUN pip install --no-cache-dir .
 
 
-# One-shot job behind `make migrate`, never started by `make up`
+# One-shot job that `make up` runs once, before the services start
 FROM base AS migrate
 
 COPY alembic.ini ./
@@ -31,4 +31,4 @@ COPY ${SERVICE}/ ./${SERVICE}/
 EXPOSE 8000
 
 # Shell form, because expansion of $SERVICE is needed here
-CMD uvicorn ${SERVICE}.main:app --host 0.0.0.0 --port 8000
+CMD exec uvicorn ${SERVICE}.main:app --host 0.0.0.0 --port 8000

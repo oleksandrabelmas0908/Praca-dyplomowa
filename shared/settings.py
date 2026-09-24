@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
     env: Literal["local", "server"] = "local"
 
+    postgres_host: str
+    postgres_user: str
+    postgres_password: str
+    postgres_db: str
+    db_pool_size: int
+    db_max_overflow: int
+
     @field_validator("log_level", mode="before")
     @classmethod
     def uppercase(cls, value: str) -> str:

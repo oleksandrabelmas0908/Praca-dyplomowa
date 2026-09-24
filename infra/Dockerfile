@@ -1,8 +1,4 @@
-FROM python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
-
-# Which service this image runs - passed in from docker-compose.yml
-ARG SERVICE
-ENV SERVICE=${SERVICE}
+FROM python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS base
 
 WORKDIR /app
 
@@ -11,6 +7,23 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY shared/ ./shared/
 RUN pip install --no-cache-dir .
+
+
+# One-shot job behind `make migrate`, never started by `make up`
+FROM base AS migrate
+
+COPY alembic.ini ./
+COPY migrations/ ./migrations/
+
+CMD ["alembic", "upgrade", "head"]
+
+
+# Last stage, so the service builds in docker-compose.yml get it without naming a target
+FROM base
+
+# Which service this image runs - passed in from docker-compose.yml
+ARG SERVICE
+ENV SERVICE=${SERVICE}
 
 # The one service this image runs
 COPY ${SERVICE}/ ./${SERVICE}/

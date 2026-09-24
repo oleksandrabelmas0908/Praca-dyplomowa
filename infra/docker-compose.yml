@@ -1,4 +1,51 @@
 services:
+  postgres:
+    image: postgres@sha256:86c951e05bf56c93d95d397747fb8820ac76cc3bedb78f43abd83eedbe3666ae  # 18.6
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - shop
+    cpus: 2.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      target: migrate
+    # Only runs through `make migrate`: the profile keeps it out of `make up`
+    profiles:
+      - migrate
+    environment:
+      SERVICE_NAME: migrate
+      LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   catalog:
     build:
       context: .
@@ -11,12 +58,21 @@ services:
       SERVICE_NAME: catalog
       LOG_LEVEL: ${LOG_LEVEL}
       ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
     networks:
       - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -34,12 +90,21 @@ services:
       SERVICE_NAME: orders
       LOG_LEVEL: ${LOG_LEVEL}
       ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
     networks:
       - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -57,12 +122,21 @@ services:
       SERVICE_NAME: inventory
       LOG_LEVEL: ${LOG_LEVEL}
       ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
     networks:
       - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -80,12 +154,21 @@ services:
       SERVICE_NAME: payments
       LOG_LEVEL: ${LOG_LEVEL}
       ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
     networks:
       - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -103,12 +186,21 @@ services:
       SERVICE_NAME: billing
       LOG_LEVEL: ${LOG_LEVEL}
       ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
     networks:
       - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
     cpus: 1.0
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -116,3 +208,6 @@ services:
 
 networks:
   shop:
+
+volumes:
+  postgres_data:

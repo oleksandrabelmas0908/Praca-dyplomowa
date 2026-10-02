@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     postgres_db: str
     db_pool_size: int
     db_max_overflow: int
+    db_driver: Literal["async", "sync"] = "async"
 
     kafka_bootstrap_servers: str
 

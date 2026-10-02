@@ -1,7 +1,8 @@
+import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from catalog.routes import router as catalog_router
+from catalog.routes import async_routes, sync_routes
 from shared.db import database_ready, lifespan
 from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
@@ -9,11 +10,14 @@ from shared.middleware import CorrelationId
 from shared.settings import settings
 
 setup_logging(settings.service_name, settings.log_level)
+logger = structlog.get_logger()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CorrelationId)
 
+catalog_router = sync_routes.router if settings.db_driver == "sync" else async_routes.router
 app.include_router(catalog_router, prefix="/catalog", tags=["catalog"])
+logger.info("database driver", driver=settings.db_driver)
 
 
 @app.get("/health")

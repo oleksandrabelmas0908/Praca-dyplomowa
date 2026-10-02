@@ -1,19 +1,19 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import UUID
 
 import structlog
 from fastapi import FastAPI, Request
-from sqlalchemy import URL, DateTime, Text, func, text
+from sqlalchemy import URL, DateTime, Engine, Text, create_engine, func, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from shared.settings import settings
 
@@ -55,12 +55,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.engine = engine
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    sync_engine: Engine | None = None
+    if settings.db_driver == "sync":
+        sync_engine = create_engine(
+            database_url().set(drivername="postgresql+psycopg2"),
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+        )
+        app.state.sync_session_factory = sessionmaker(sync_engine, expire_on_commit=False)
     yield
     await engine.dispose()
+    if sync_engine is not None:
+        sync_engine.dispose()
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     async with request.app.state.session_factory() as session:
+        yield session
+
+
+def get_sync_session(request: Request) -> Iterator[Session]:
+    with request.app.state.sync_session_factory() as session:
         yield session
 
 

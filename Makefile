@@ -8,7 +8,11 @@ KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 # Empty until orders and inventory emit real events, then their topics are listed here
 TOPICS =
 
-.PHONY: up down seed health lint
+# Defaults for make test, override with e.g. make test REQUESTS=200 LIMIT=50
+REQUESTS ?= 100
+LIMIT ?= 1000
+
+.PHONY: up down seed health lint test
 
 # Services start last, so the schema and the topics already exist when their consumers start.
 # An existing topic keeps its partition count, so a changed KAFKA_PARTITIONS fails here loudly
@@ -45,4 +49,8 @@ health:
 	@curl -sS localhost:$(PAYMENTS_PORT)/ready && echo
 	@curl -fsS localhost:$(BILLING_PORT)/health && echo
 	@curl -sS localhost:$(BILLING_PORT)/ready && echo
+
+# REQUESTS parallel requests to GET /catalog/products?limit=LIMIT, with server and client times
+test:
+	python3 bench/parallel_products.py --requests $(REQUESTS) --limit $(LIMIT)
 

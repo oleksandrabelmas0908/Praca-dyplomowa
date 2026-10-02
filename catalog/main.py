@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from catalog.routes import router as catalog_router
 from shared.db import database_ready, lifespan
 from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
@@ -11,6 +12,8 @@ setup_logging(settings.service_name, settings.log_level)
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CorrelationId)
+
+app.include_router(catalog_router, prefix="/catalog", tags=["catalog"])
 
 
 @app.get("/health")

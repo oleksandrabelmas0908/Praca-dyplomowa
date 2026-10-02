@@ -10,7 +10,7 @@ from sqlalchemy import func, insert, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from catalog.db import Product
+from catalog.models import Product
 from shared.db import database_url
 from shared.logging import setup_logging
 from shared.settings import settings
@@ -57,8 +57,6 @@ logger = structlog.get_logger()
 def product(rng: random.Random) -> dict[str, Any]:
     category = rng.choice(list(CATEGORIES))
     name = f"{rng.choice(ADJECTIVES)} {rng.choice(CATEGORIES[category])} {rng.randint(100, 999)}"
-    # 1,400-1,800 characters: a realistic row size that still stays under Postgres' ~2 kB TOAST
-    # threshold, so rows are stored inline and uncompressed
     description = " ".join(rng.choices(SENTENCES, k=30))[: rng.randint(1_400, 1_800)]
     return {
         "name": name,
@@ -75,8 +73,6 @@ async def main() -> None:
     started = time.perf_counter()
     rng = random.Random(RANDOM_SEED)
     engine = create_async_engine(database_url(), poolclass=NullPool)
-    # One transaction, so a failed seed leaves the previous catalogue in place. TRUNCATE rather
-    # than refusing, so re-running restores the exact catalogue after an experiment changed it
     async with engine.begin() as connection:
         await connection.execute(text("TRUNCATE products RESTART IDENTITY"))
         for _ in range(PRODUCT_COUNT // BATCH_SIZE):

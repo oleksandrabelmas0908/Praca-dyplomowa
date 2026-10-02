@@ -1,25 +1,35 @@
-from datetime import datetime
+from collections.abc import Sequence
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Index, Numeric, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import ColumnElement, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.db import Base
+from catalog.models import Product
 
 
-class Product(Base):
-    __tablename__ = "products"
-    __table_args__ = (Index("ix_products_category_id", "category", "id"),)
+async def get_product(session: AsyncSession, product_id: int) -> Product | None:
+    result = await session.execute(select(Product).where(Product.id == product_id))
+    return result.scalar_one_or_none()
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(Text)
-    description: Mapped[str] = mapped_column(Text)
-    price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-    category: Mapped[str] = mapped_column(Text)
-    stock_quantity: Mapped[int]
-    image_paths: Mapped[list[str]] = mapped_column(JSONB, server_default="[]")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+
+async def list_products(
+    session: AsyncSession,
+    category: str | None,
+    min_price: Decimal | None,
+    max_price: Decimal | None,
+    limit: int,
+    offset: int,
+) -> tuple[Sequence[Product], int]:
+    filters: list[ColumnElement[bool]] = []
+    if category is not None:
+        filters.append(Product.category == category)
+    if min_price is not None:
+        filters.append(Product.price >= min_price)
+    if max_price is not None:
+        filters.append(Product.price <= max_price)
+
+    products = await session.execute(
+        select(Product).where(*filters).order_by(Product.id).limit(limit).offset(offset)
     )
+    total = await session.execute(select(func.count()).select_from(Product).where(*filters))
+    return products.scalars().all(), total.scalar_one()

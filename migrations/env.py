@@ -5,7 +5,7 @@ from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-import catalog.db
+import catalog.models
 from shared.db import Base, database_url
 from shared.logging import setup_logging
 from shared.settings import settings

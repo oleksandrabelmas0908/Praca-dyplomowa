@@ -2,6 +2,7 @@ import time
 from uuid import UUID, uuid4
 
 import structlog
+from fastapi.routing import iter_route_contexts
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -29,10 +30,12 @@ def read_correlation_id(scope: Scope) -> str:
 
 def endpoint_label(scope: Scope) -> str:
     partial: str | None = None
-    for route in scope["app"].routes:
+    # app.routes holds an included router as one entry with no path, this yields its routes
+    # with the include prefix applied
+    for route in iter_route_contexts(scope["app"].routes):
         match, _ = route.matches(scope)
         if match == Match.FULL:
-            return route.path
+            return route.path or "unmatched"
         if match == Match.PARTIAL and partial is None:
             partial = route.path
     return partial or "unmatched"

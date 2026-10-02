@@ -8,7 +8,7 @@ KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 # Empty until orders and inventory emit real events, then their topics are listed here
 TOPICS =
 
-.PHONY: up down health lint
+.PHONY: up down seed health lint
 
 # Services start last, so the schema and the topics already exist when their consumers start.
 # An existing topic keeps its partition count, so a changed KAFKA_PARTITIONS fails here loudly
@@ -29,6 +29,10 @@ up:
 
 down:
 	$(COMPOSE) down
+
+# Replaces the whole catalogue, so it always ends with the same products
+seed:
+	$(COMPOSE) exec -T catalog python -m catalog.seed
 
 health:
 	@curl -fsS localhost:$(CATALOG_PORT)/health && echo

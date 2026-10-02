@@ -5,8 +5,7 @@ from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-# Autogenerate only sees tables whose models have been imported. shared.db brings processed_events;
-# add each service's models module here when that service gets its first table.
+import catalog.db
 from shared.db import Base, database_url
 from shared.logging import setup_logging
 from shared.settings import settings

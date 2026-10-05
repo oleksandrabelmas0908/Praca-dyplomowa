@@ -1,9 +1,15 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import structlog
+from anyio import to_thread
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from catalog import cache
 from catalog.routes import async_routes, sync_routes
-from shared.db import database_ready, lifespan
+from shared.db import database_ready
+from shared.db import lifespan as db_lifespan
 from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
 from shared.middleware import CorrelationId
@@ -11,6 +17,19 @@ from shared.settings import settings
 
 setup_logging(settings.service_name, settings.log_level)
 logger = structlog.get_logger()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Per worker process: each one has its own event loop and so its own threadpool
+    to_thread.current_default_thread_limiter().total_tokens = settings.threadpool_size
+    async with db_lifespan(app):
+        # None when CACHE_ENABLED=false, so no Redis connection is ever made
+        app.state.cache = await cache.connect() if settings.cache_enabled else None
+        yield
+        if app.state.cache is not None:
+            await app.state.cache.aclose()
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CorrelationId)

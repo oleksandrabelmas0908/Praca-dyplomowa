@@ -21,3 +21,11 @@ class ProductResponse(BaseModel):
 class ProductListResponse(BaseModel):
     items: list[ProductResponse]
     total: int
+
+
+class ProductUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    price: Decimal | None = None
+    category: str | None = None
+    stock_quantity: int | None = None

@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     db_pool_size: int
     db_max_overflow: int
     db_driver: Literal["async", "sync"] = "async"
+    threadpool_size: int = 40
+
+    cache_enabled: bool = False
+    cache_ttl_seconds: int = 60
+    redis_cache_url: str = ""
 
     kafka_bootstrap_servers: str
 

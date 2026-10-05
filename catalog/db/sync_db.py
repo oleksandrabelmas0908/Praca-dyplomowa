@@ -1,7 +1,8 @@
 from collections.abc import Sequence
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import ColumnElement, Numeric, func, literal, select
+from sqlalchemy import ColumnElement, Numeric, func, literal, select, update
 from sqlalchemy.orm import Session
 
 from catalog.models import Product
@@ -35,3 +36,15 @@ def list_products(
     )
     total = session.execute(select(func.count()).select_from(Product).where(*filters))
     return products.scalars().all(), total.scalar_one()
+
+
+def update_product(session: Session, product_id: int, values: dict[str, Any]) -> Product | None:
+    if not values:
+        return get_product(session, product_id)
+    # RETURNING brings back updated_at, which Postgres sets, without a second query
+    result = session.execute(
+        update(Product).where(Product.id == product_id).values(**values).returning(Product)
+    )
+    product = result.scalar_one_or_none()
+    session.commit()
+    return product

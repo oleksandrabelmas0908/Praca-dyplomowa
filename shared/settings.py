@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 60
     redis_cache_url: str = ""
 
+    redis_broker_url: str = ""
+    celery_concurrency: int = 1
+
     kafka_bootstrap_servers: str
 
     @field_validator("log_level", mode="before")

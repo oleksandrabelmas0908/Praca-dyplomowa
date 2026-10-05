@@ -29,3 +29,8 @@ class ProductUpdate(BaseModel):
     price: Decimal | None = None
     category: str | None = None
     stock_quantity: int | None = None
+
+
+class ImageUploadResponse(BaseModel):
+    product_id: int
+    status: str

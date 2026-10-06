@@ -26,6 +26,8 @@ class Settings(BaseSettings):
 
     redis_broker_url: str = ""
     celery_concurrency: int = 1
+    queue_depth_interval_seconds: float = 5
+    worker_metrics_url: str = ""
 
     kafka_bootstrap_servers: str
 

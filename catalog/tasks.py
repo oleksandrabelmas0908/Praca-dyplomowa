@@ -10,13 +10,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from catalog.models import Product
+from shared.celery_metrics import DEAD_LETTER_QUEUE
 from shared.db import database_url
 from shared.logging import setup_logging
 from shared.middleware import HEADER
 from shared.settings import settings
 
 IMAGE_DIR = Path("/images")
-DEAD_LETTER_QUEUE = "dead_letter"
 # Longest side in pixels
 SIZES = {"thumbnail": 150, "small": 300, "medium": 600, "large": 1200}
 

@@ -1,3 +1,4 @@
+import urllib.request
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,8 @@ from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
 from shared.middleware import CorrelationId
 from shared.settings import settings
+
+WORKER_METRICS_TIMEOUT_SECONDS = 5
 
 setup_logging(settings.service_name, settings.log_level)
 logger = structlog.get_logger()
@@ -58,3 +61,11 @@ async def ready(request: Request) -> JSONResponse:
 @app.get("/metrics")
 async def metrics() -> Response:
     return Response(generate_metrics(), media_type=CONTENT_TYPE)
+
+
+@app.get("/worker/metrics")
+def worker_metrics() -> Response:
+    with urllib.request.urlopen(
+        settings.worker_metrics_url, timeout=WORKER_METRICS_TIMEOUT_SECONDS
+    ) as response:
+        return Response(response.read(), media_type=CONTENT_TYPE)

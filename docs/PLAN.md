@@ -136,3 +136,51 @@ Tasks still waiting in the queue are not in Flower's task list, because that nee
 events from `catalog`, which are off. The broker page shows the queue length instead. The REST
 API under `/api` answers 401 because no authentication is configured; the web UI does not use
 it. The port is bound to localhost because Flower can shut down workers.
+
+## Worker metrics (TASK-10)
+
+### Where they come from
+
+`shared/celery_metrics.py` collects everything through Celery signals; importing it registers
+them. `before_task_publish` writes `published_at` (Unix time) into the task headers, `task_prerun`
+observes the queue wait from it, `task_postrun` the duration and successes, `task_retry` and
+`task_failure` the other two outcomes.
+
+Prefork runs every task, and so every task signal, in a pool child, never in the parent. Each
+child tries to bind port 9000 at `worker_process_init`; the first one serves `/metrics` from its own
+registry and polls the queue depth, the others skip. **With `CELERY_CONCURRENCY=1` the metrics
+cover every task of the container; above 1 they cover only that one child's tasks** (measured with
+2: four uploads, two counted). Scaling therefore goes through replicas, each scraped on its own.
+A task whose child is killed fails in the parent (`WorkerLostError`), so that failure is not
+counted either.
+
+The port is reachable on the `shop` network only (`catalog-worker:9000`), not from the host.
+`catalog` passes it through at `GET /worker/metrics`, so it can be read at
+`localhost:${CATALOG_PORT}/worker/metrics`. With several worker replicas, each request reaches
+one of them.
+
+### Buckets
+
+| Histogram | Range | Why |
+|---|---|---|
+| `celery_task_duration_seconds` | 10 ms to 30 s | image processing takes hundreds of ms to seconds, the 600 px test image about 20 ms |
+| `celery_task_queue_wait_seconds` | 5 ms to 300 s | near zero while idle, minutes under backlog; a task redelivered after its worker was killed waits 120 to 230 s |
+
+### Queue wait caveats
+
+- Publisher and worker are separate processes, so the wait is only right if their clocks agree.
+  All containers run on one host and share its clock. If publisher and worker ever run on two
+  machines, the wait includes the offset between their clocks.
+- A retry is published again with its backoff countdown, so the wait of a retried run includes
+  that countdown (measured: four retries, 10 s of countdown, 10.1 s of wait).
+
+### Queue depth
+
+A thread in the serving child reads `LLEN` of every queue the worker consumes plus `dead_letter`
+from `redis-broker` every `QUEUE_DEPTH_INTERVAL_SECONDS` (default 5). Nothing serves the gauge
+while the worker container is stopped. To watch a backlog build, stop consumption instead:
+`celery -A catalog.tasks control cancel_consumer cpu`, then `add_consumer cpu`.
+
+Measured with the worker stopped, five uploads 5 s apart, then the worker started: the
+histogram's sum was 109.0 s against 109.1 s from the logs, with waits of 11.7 to 31.9 s each in
+the matching bucket.

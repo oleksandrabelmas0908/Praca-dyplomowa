@@ -184,3 +184,14 @@ while the worker container is stopped. To watch a backlog build, stop consumptio
 Measured with the worker stopped, five uploads 5 s apart, then the worker started: the
 histogram's sum was 109.0 s against 109.1 s from the logs, with waits of 11.7 to 31.9 s each in
 the matching bucket.
+
+## Orders (TASK-11)
+
+### Unit price from the products table
+
+Each line in `POST /orders` has only `product_id` and `quantity`. Orders reads `price` for every
+line from `products` and copies it into `order_lines.unit_price`, in the same transaction that
+writes the order, so a later price change does not alter an order already placed. It reads the
+table directly instead of calling catalog's API: every service shares one database, so this adds
+one primary-key query to the write path and no second service. A `product_id` that is not in
+`products` rejects the whole order with 422, and nothing is written.

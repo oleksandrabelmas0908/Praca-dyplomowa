@@ -16,6 +16,7 @@ COPY alembic.ini ./
 COPY migrations/ ./migrations/
 # migrations/env.py imports each service's models
 COPY catalog/ ./catalog/
+COPY orders/ ./orders/
 
 CMD ["alembic", "upgrade", "head"]
 

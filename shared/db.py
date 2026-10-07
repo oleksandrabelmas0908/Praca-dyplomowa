@@ -2,11 +2,13 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 import structlog
 from fastapi import FastAPI, Request
-from sqlalchemy import URL, DateTime, Engine, Text, create_engine, func, text
+from sqlalchemy import URL, DateTime, Engine, Index, Text, create_engine, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -34,6 +36,22 @@ class ProcessedEvent(Base):
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        Index(
+            "ix_outbox_events_undispatched", "id", postgresql_where=text("dispatched_at IS NULL")
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topic: Mapped[str] = mapped_column(Text)
+    message_key: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 def database_url() -> URL:

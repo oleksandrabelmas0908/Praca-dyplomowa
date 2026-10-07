@@ -5,8 +5,8 @@ COMPOSE = docker compose -f infra/docker-compose.yml --project-directory .
 # Small heap of its own, because the broker's KAFKA_HEAP_OPTS would give this JVM 512m too
 KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 	/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092
-# Empty until orders and inventory emit real events, then their topics are listed here
-TOPICS =
+# Every topic a service publishes to
+TOPICS = order.created inventory.rejected payment.completed
 
 # Defaults for make test, override with e.g. make test REQUESTS=200 LIMIT=50
 REQUESTS ?= 100
@@ -33,7 +33,7 @@ up:
 	$(COMPOSE) up -d --wait
 
 down:
-	$(COMPOSE) --profile obs down
+	$(COMPOSE) --profile obs down -v
 
 obs: up
 	$(COMPOSE) --profile obs up -d --wait flower

@@ -11,11 +11,12 @@ from shared.settings import settings
 logger = structlog.get_logger()
 
 
-# Decorator for event handlers that ensures an event is processed only once
-def idempotent(
-    handler: Callable[[AsyncSession, Event], Awaitable[None]],
-) -> Callable[[async_sessionmaker[AsyncSession], Event], Awaitable[None]]:
-    async def wrapper(session_factory: async_sessionmaker[AsyncSession], event: Event) -> None:
+# Decorator for event handlers that ensures an event is processed only once. Returns the handler's
+# result once the transaction has committed, or None if the event was already processed
+def idempotent[T](
+    handler: Callable[[AsyncSession, Event], Awaitable[T]],
+) -> Callable[[async_sessionmaker[AsyncSession], Event], Awaitable[T | None]]:
+    async def wrapper(session_factory: async_sessionmaker[AsyncSession], event: Event) -> T | None:
         async with session_factory() as session, session.begin():
             inserted = await session.scalar(
                 insert(ProcessedEvent)
@@ -25,7 +26,7 @@ def idempotent(
             )
             if inserted is None:
                 logger.debug("event already processed", event_id=str(event.event_id))
-                return
-            await handler(session, event)
+                return None
+            return await handler(session, event)
 
     return wrapper

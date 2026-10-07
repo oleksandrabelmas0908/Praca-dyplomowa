@@ -6,6 +6,8 @@ from sqlalchemy.orm import selectinload
 
 from orders.models import Order, OrderLine
 from orders.schemas import OrderLineCreate
+from shared.db import OutboxEvent
+from shared.events import Event
 
 products = table("products", column("id", Integer), column("price", Numeric(10, 2)))
 
@@ -36,6 +38,31 @@ async def create_order(
         ],
     )
     session.add(order)
+    await session.flush()
+    event = Event(
+        event_type="order.created",
+        occurred_at=order.created_at,
+        payload={
+            "order_id": order.id,
+            "customer_id": order.customer_id,
+            "total_amount": order.total_amount,
+            "lines": [
+                {
+                    "product_id": line.product_id,
+                    "quantity": line.quantity,
+                    "unit_price": line.unit_price,
+                }
+                for line in order.lines
+            ],
+        },
+    )
+    session.add(
+        OutboxEvent(
+            topic=event.event_type,
+            message_key=str(order.id),
+            payload=event.model_dump(mode="json"),
+        )
+    )
     await session.commit()
     return order
 

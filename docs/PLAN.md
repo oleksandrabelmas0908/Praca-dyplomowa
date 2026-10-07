@@ -195,3 +195,156 @@ writes the order, so a later price change does not alter an order already placed
 table directly instead of calling catalog's API: every service shares one database, so this adds
 one primary-key query to the write path and no second service. A `product_id` that is not in
 `products` rejects the whole order with 422, and nothing is written.
+
+## Outbox (TASK-12)
+
+### Write path
+
+`POST /orders` flushes the order to get its ID, then adds one `outbox_events` row in the same
+transaction: topic `order.created`, `message_key` the order ID, `payload` the full event envelope
+as JSONB. `occurred_at` in the envelope, `orders.created_at` and `outbox_events.created_at` are the
+same value, Postgres `now()`, which is the start of the request's transaction (the price lookup).
+The outbox lag therefore also includes the request's own few milliseconds in the database.
+
+Measured: with a check constraint that rejects every outbox row, `POST /orders` returned 500 and
+left no order, no order lines and no outbox row.
+
+### Poller
+
+Every Uvicorn worker process runs one poller, started in the lifespan next to the gauge and
+cleanup loops. A pass is one transaction: claim up to 100 of the oldest undispatched rows with
+`FOR UPDATE SKIP LOCKED`, hand them all to the producer in ID order, wait for every confirmation,
+mark the confirmed ones with one `UPDATE`, commit. The row locks last until the commit, so a
+second poller skips those rows instead of publishing them again. After a pass that claimed fewer
+than 100 rows the poller sleeps `OUTBOX_POLL_INTERVAL_SECONDS` (0.1 s); after a full batch it
+starts the next pass at once, so a backlog is not capped at 100 rows per interval.
+
+`dispatched_at` comes from the orders container's clock after the confirmation, `created_at` from
+Postgres. Both run on one host and share its clock, the same caveat as the Celery queue wait.
+
+### Ordering
+
+Within a pass rows are sent in ID order, and aiokafka keeps at most one request in flight per
+partition, so a partition receives them in that order. If a send fails, the rest of the batch is
+left for the next pass, so no later row overtakes it. The price is that a row Kafka never
+accepts holds back every row behind it. It is never dropped, and the error log after 5 failures is
+how it shows up.
+
+Across pollers this is not guaranteed: two pollers could each claim a row with the same key and
+publish them in either order. Orders writes exactly one row per order (`order.created`), so this
+cannot happen today. It has to be revisited if orders ever emits a second event per order.
+
+### Failures
+
+- A failed publish leaves `dispatched_at` NULL and logs a warning with `outbox_event_id` and
+  `correlation_id`; from the 5th failure of the same row it is an error. The count is kept in
+  process memory, so a restart resets it and several workers split it between their pollers.
+- A pass that claimed rows but published none, or that failed on the database, is followed by a
+  backoff: poll interval × 2ⁿ, capped at 30 s. Kafka unreachable at startup gets the same backoff
+  around starting the producer; the API is not affected.
+- aiokafka fails a send only after `request_timeout_ms` (default 40 s), so while Kafka is down
+  each pass takes about 40 s and holds its transaction, its row locks and one pool connection for
+  that long. aiokafka also logs `Unable to update metadata` at error level every 100 ms while sends
+  are pending.
+
+Measured with Kafka stopped at 10:38:25: 31 orders were accepted (6 ms per `POST`), passes failed
+every ~40 s, the oldest row's 5th failure at 10:41:49 was logged at error, and
+`outbox_undispatched_events` stayed at 31. Kafka was started at 10:42:02; the 31 events were
+published by 10:42:05, each exactly once, and the gauge went back to 0.
+
+### Retention
+
+Every 60 s each worker deletes dispatched rows older than `OUTBOX_RETENTION_SECONDS` (24 h),
+1000 per transaction, with `SKIP LOCKED` so workers do not wait on each other. An undispatched row
+has `dispatched_at` NULL and never matches the age condition. There is no index on
+`dispatched_at`, so every cleanup pass is a sequential scan over the rows the window holds.
+
+Measured with a 30 s window and Kafka stopped: one cleanup deleted 74,339 dispatched rows and kept
+the 5 undispatched rows, which were 58 s old.
+
+### Metrics
+
+| Metric | Type | Content |
+|---|---|---|
+| `outbox_lag_seconds` | histogram | `created_at` to `dispatched_at`, buckets 5 ms to 600 s |
+| `outbox_undispatched_events` | gauge | count of undispatched rows, every 5 s |
+| `outbox_publish_attempts_total{outcome}` | counter | `success` / `failure`, one per row attempt |
+
+With several Uvicorn workers each process has its own registry and `/metrics` answers from one of
+them, as for every other metric.
+
+### Lag under load
+
+One Uvicorn worker, `POST /orders` at a constant rate for 20 s per step, lag read from the table,
+local Docker:
+
+| Orders/s | p50 | p95 | p99 | orders CPU |
+|---|---|---|---|---|
+| 20 | 62 ms | 111 ms | 118 ms | |
+| 100 | 56 ms | 103 ms | 107 ms | |
+| 400 | 56 ms | 102 ms | 112 ms | |
+| 600 | 58 ms | 106 ms | 123 ms | 84 % |
+| 800 | 67 ms | 128 ms | 144 ms | 85 % |
+| 1000 | 74 ms | 136 ms | 157 ms | 98 % |
+
+Below saturation the lag is the poll interval: a wait spread evenly over 0 to 100 ms plus a few
+milliseconds to publish. It rises once the single CPU saturates, because the poller shares the
+event loop with the request handlers.
+
+With 4 workers at 300 orders/s (6000 orders) every order reached Kafka exactly once, with p50
+47 ms, p95 95 ms, p99 101 ms.
+
+## Status consumers (TASK-13)
+
+### Consumers
+
+The orders lifespan starts two consumers next to the outbox poller, both in consumer group
+`orders`: `inventory.rejected` moves an order to `rejected`, `payment.completed` to `paid`. Each is
+its own group member subscribed to one topic, so each gets all 3 partitions of its topic. Both
+handlers are wrapped in `@idempotent`, so the `processed_events` insert, `SELECT ... FOR UPDATE` on
+the order and the status update are one transaction, and the offset is committed after it.
+
+The row lock makes the check and the update one step: two events for the same order, from the two
+consumers or from two Uvicorn workers, are applied one after the other, and the second is checked
+against the status the first left.
+
+| Case | Order | Log | Acknowledged | Counted as |
+|---|---|---|---|---|
+| allowed by `can_transition` | changed | info | yes | `order_status_transitions_total{from_status, to_status}` |
+| not allowed by `can_transition` | unchanged | warning | yes | `order_status_transitions_rejected_total{reason="illegal_transition"}` |
+| order ID not in `orders` | none | error | yes | `{reason="unknown_order"}` |
+| `event_id` already in `processed_events` | unchanged | debug | yes | `{reason="duplicate_event"}` |
+| exception, e.g. Postgres unreachable | rolled back | error | no, retried after 1 s | not counted |
+
+Both counters are incremented after the commit, so an event retried because its transaction
+failed is counted once. Every line logged while handling carries the `correlation_id` from the
+envelope, so it joins the `POST /orders` request line.
+
+### Measured
+
+Local Docker, events from the test harness:
+
+- `inventory.rejected` for a pending order and `payment.completed` for a reserved one: both changed
+  status about 3 ms after the publish.
+- The same `event_id` published twice: one status change, one `processed_events` row,
+  `duplicate_event` 1.
+- `payment.completed` for a pending order, `inventory.rejected` for a paid one, `payment.completed`
+  for order 999999: orders unchanged, two warnings and one error, consumer lag 0 afterwards.
+- Orders SIGKILLed while its handler waited on a row lock held from psql: the transaction rolled
+  back with no `processed_events` row and the offset was not committed. After `docker compose start
+  orders` the event was redelivered and the order was `paid` 7 s later, with one row. Most of
+  those 7 s is two group joins of about 3 s each, Kafka's `group.initial.rebalance.delay.ms`.
+- The handler's connection terminated with `pg_terminate_backend` mid-transaction: one
+  `handler failed`, then the retry changed the status, and the transitions counter rose by 1.
+
+### Test harness (temporary)
+
+`orders/fake_events.py` stands in for inventory and payments until they exist, and is deleted
+then. It publishes `inventory.rejected` or `payment.completed` with payload `{"order_id": N}`, taking
+the correlation ID from the order's `order.created` row in `outbox_events`, or a new one if there
+is none. `--event-id` reuses an earlier event's ID to publish a duplicate.
+
+```
+docker compose -f infra/docker-compose.yml --project-directory . exec orders \
+    python -m orders.fake_events payment.completed 42 [--event-id <uuid>]
+```

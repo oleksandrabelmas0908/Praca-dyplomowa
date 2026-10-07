@@ -1,14 +1,30 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from orders import api
-from shared.db import database_ready, lifespan
+from orders import api, events
+from shared import outbox
+from shared.db import database_ready
+from shared.db import lifespan as db_lifespan
 from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
 from shared.middleware import CorrelationId
 from shared.settings import settings
 
 setup_logging(settings.service_name, settings.log_level)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async with (
+        db_lifespan(app),
+        outbox.poller(app.state.session_factory),
+        events.consumers(app.state.session_factory),
+    ):
+        yield
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CorrelationId)

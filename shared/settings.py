@@ -31,6 +31,9 @@ class Settings(BaseSettings):
 
     kafka_bootstrap_servers: str
 
+    outbox_poll_interval_seconds: float = 0.1
+    outbox_retention_seconds: int = 86400
+
     @field_validator("log_level", mode="before")
     @classmethod
     def uppercase(cls, value: str) -> str:

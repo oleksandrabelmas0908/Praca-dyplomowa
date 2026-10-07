@@ -1,10 +1,12 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from orders import api, events
+from orders import events
+from orders.routes import async_routes, sync_routes
 from shared import outbox
 from shared.db import database_ready
 from shared.db import lifespan as db_lifespan
@@ -14,10 +16,13 @@ from shared.middleware import CorrelationId
 from shared.settings import settings
 
 setup_logging(settings.service_name, settings.log_level)
+logger = structlog.get_logger()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Async under both DB_DRIVER values: the flag compares the HTTP request path, which is what the
+    # load generator drives, and these background loops are not part of that comparison
     async with (
         db_lifespan(app),
         outbox.poller(app.state.session_factory),
@@ -28,7 +33,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CorrelationId)
-app.include_router(api.router, tags=["orders"])
+
+orders_router = sync_routes.router if settings.db_driver == "sync" else async_routes.router
+app.include_router(orders_router, tags=["orders"])
+logger.info("database driver", driver=settings.db_driver)
 
 
 @app.get("/health")

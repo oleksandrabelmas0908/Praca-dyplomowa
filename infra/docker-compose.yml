@@ -278,8 +278,9 @@ services:
       dockerfile: infra/Dockerfile
       args:
         SERVICE: inventory
+    scale: ${INVENTORY_REPLICAS}
     ports:
-      - "${INVENTORY_PORT}:8000"
+      - "8000"
     environment:
       SERVICE_NAME: inventory
       LOG_LEVEL: ${LOG_LEVEL}
@@ -291,6 +292,8 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS}
+      OUTBOX_RETENTION_SECONDS: ${OUTBOX_RETENTION_SECONDS}
     networks:
       - shop
     depends_on:

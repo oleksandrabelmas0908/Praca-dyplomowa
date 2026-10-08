@@ -78,13 +78,15 @@ async def start_producer() -> AIOKafkaProducer:
 
 
 async def dispatch_batch(
-    session_factory: async_sessionmaker[AsyncSession], producer: AIOKafkaProducer
+    session_factory: async_sessionmaker[AsyncSession],
+    producer: AIOKafkaProducer,
+    topics: list[str],
 ) -> tuple[int, int]:
     async with session_factory() as session, session.begin():
         rows = (
             await session.scalars(
                 select(OutboxEvent)
-                .where(OutboxEvent.dispatched_at.is_(None))
+                .where(OutboxEvent.dispatched_at.is_(None), OutboxEvent.topic.in_(topics))
                 .order_by(OutboxEvent.id)
                 .limit(BATCH_SIZE)
                 .with_for_update(skip_locked=True)
@@ -130,14 +132,16 @@ async def dispatch_batch(
     return len(rows), len(published)
 
 
-async def dispatch_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
+async def dispatch_loop(
+    session_factory: async_sessionmaker[AsyncSession], topics: list[str]
+) -> None:
     producer = await start_producer()
     failed_passes = 0
     try:
         while True:
             claimed = 0
             try:
-                claimed, published = await dispatch_batch(session_factory, producer)
+                claimed, published = await dispatch_batch(session_factory, producer, topics)
                 failed = claimed > 0 and published == 0
             except Exception as error:  # noqa: BLE001 - e.g. Postgres unreachable, the loop must go on
                 logger.warning("outbox poll failed", error=repr(error))
@@ -153,7 +157,7 @@ async def dispatch_loop(session_factory: async_sessionmaker[AsyncSession]) -> No
         await producer.stop()
 
 
-async def gauge_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
+async def gauge_loop(session_factory: async_sessionmaker[AsyncSession], topics: list[str]) -> None:
     while True:
         try:
             async with session_factory() as session:
@@ -161,7 +165,7 @@ async def gauge_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
                     await session.execute(
                         select(func.count())
                         .select_from(OutboxEvent)
-                        .where(OutboxEvent.dispatched_at.is_(None))
+                        .where(OutboxEvent.dispatched_at.is_(None), OutboxEvent.topic.in_(topics))
                     )
                 ).scalar_one()
             outbox_undispatched_events.set(count)
@@ -170,7 +174,9 @@ async def gauge_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
         await asyncio.sleep(GAUGE_INTERVAL_SECONDS)
 
 
-async def cleanup_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
+async def cleanup_loop(
+    session_factory: async_sessionmaker[AsyncSession], topics: list[str]
+) -> None:
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
         cutoff = datetime.now(UTC) - timedelta(seconds=settings.outbox_retention_seconds)
@@ -184,7 +190,10 @@ async def cleanup_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
                         .where(
                             OutboxEvent.id.in_(
                                 select(OutboxEvent.id)
-                                .where(OutboxEvent.dispatched_at < cutoff)
+                                .where(
+                                    OutboxEvent.dispatched_at < cutoff,
+                                    OutboxEvent.topic.in_(topics),
+                                )
                                 .limit(CLEANUP_BATCH_SIZE)
                                 .with_for_update(skip_locked=True)
                             )
@@ -200,9 +209,13 @@ async def cleanup_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
 
 
 @asynccontextmanager
-async def poller(session_factory: async_sessionmaker[AsyncSession]) -> AsyncIterator[None]:
+async def poller(
+    session_factory: async_sessionmaker[AsyncSession], topics: list[str]
+) -> AsyncIterator[None]:
     tasks = asyncio.gather(
-        dispatch_loop(session_factory), gauge_loop(session_factory), cleanup_loop(session_factory)
+        dispatch_loop(session_factory, topics),
+        gauge_loop(session_factory, topics),
+        cleanup_loop(session_factory, topics),
     )
     try:
         yield

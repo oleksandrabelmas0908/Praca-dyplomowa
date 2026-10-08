@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # load generator drives, and these background loops are not part of that comparison
     async with (
         db_lifespan(app),
-        outbox.poller(app.state.session_factory),
+        outbox.poller(app.state.session_factory, ["order.created"]),
         events.consumers(app.state.session_factory),
     ):
         yield

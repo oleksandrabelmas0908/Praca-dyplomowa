@@ -425,3 +425,103 @@ Temporary scripts against a separate seeded database, local Docker, two runs wit
 - 5,000 random orders over 300 seeded products, 2 % with an unknown product: available + reserved
   equal to the seeded quantity for all 100,000 products, nothing negative, and the columns catalog
   serves, `updated_at` included, unchanged.
+
+## Inventory (TASK-16)
+
+### Handler
+
+The inventory lifespan starts one consumer on `order.created` in consumer group `inventory`, next to
+an outbox poller, as in orders. The handler is wrapped in `@idempotent`, so the `processed_events`
+insert, `reserve_all` and the outcome's `outbox_events` row are one transaction, and the offset is
+committed after it. A handler that raises leaves all three rolled back and the offset uncommitted,
+and the shared consumer seeks back and redelivers the event 1 s later.
+
+`reserve_all` now returns `None` when every line is reserved, or a `Rejection` with `reason`,
+`product_id`, `requested` and `available` for the line that failed. It stops at the first failing
+line in product ID order, so a rejection names one product even if later lines are short too. The
+check after a failed `UPDATE` reads `stock_quantity` instead of `id`, so the shortfall costs no
+extra query. That read sees a newer snapshot than the `UPDATE` did, but committed stock only
+falls, so `available` is never above what the `UPDATE` saw and `missing` is at least 1.
+
+### Events
+
+Key is the order ID, `correlation_id` is copied from the `order.created` envelope, and
+`occurred_at` is taken when the handler builds the event, right after `reserve_all`. That is about
+a millisecond after the outbox row's `created_at`, which is the start of the transaction.
+
+| Topic | Payload |
+|---|---|
+| `inventory.reserved` | `order_id` |
+| `inventory.rejected` | `order_id`, `reason`, `product_id`, `requested`, `available`, `missing` |
+
+`reason` is `insufficient_stock` or `product_not_found`. For an unknown product `available` is 0
+and `missing` equals `requested`.
+
+### Logs and metrics
+
+| Case | Log | Counted as |
+|---|---|---|
+| every line reserved | info `stock reserved` | `reservations_total{outcome="reserved"}` |
+| a line short | info `order rejected` | `{outcome="rejected"}` |
+| a product ID not in `products` | error `order rejected, unknown product` | `{outcome="rejected"}` |
+| `event_id` already in `processed_events` | debug | `reservation_duplicates_total` |
+| exception | error `handler failed, event will be redelivered` | `{outcome="error"}`, once per failed attempt |
+
+`reserved`, `rejected` and duplicates are counted after the commit, `error` before the redelivery.
+`reservation_handler_duration_seconds` covers the whole wrapped handler, from the idempotency insert
+to the commit, for every attempt including duplicates and failures, with buckets from 0.5 ms to 5 s.
+
+Every line carries `correlation_id`, bound by the shared consumer, and `order_id`, bound before the
+idempotency insert. `product_id` is bound while each line is reserved and stays bound if the
+reservation raises, so the failure line names the product it was reserving.
+
+### Outbox per service
+
+`outbox_events` is one table for every service, so `outbox.poller` takes the topics its service
+publishes and filters the claim, the undispatched gauge and the cleanup by them: orders passes
+`order.created`, inventory `inventory.reserved` and `inventory.rejected`. Without the filter each
+poller published the other service's rows as well, and the outbox metrics described whichever
+process claimed a row. Inventory replicas still share their own rows through `SKIP LOCKED`, so one
+replica's `outbox_publish_attempts_total` does not match its own `reservations_total`.
+
+Inventory writes one row per order, like orders, so the cross-poller ordering caveat from TASK-12
+still does not apply.
+
+### Scaling
+
+`INVENTORY_REPLICAS` sets the number of inventory containers, applied by `make up`. The host port is
+picked by Docker, so the replicas do not collide; `docker compose port --index N inventory 8000`
+finds replica N, and `make health` checks replica 1.
+All replicas join group `inventory`, so with `KAFKA_PARTITIONS=3` at most 3 consume and any further
+replica stays idle. A replica handles one event at a time.
+
+### Measured
+
+Local Docker, one replica unless stated:
+
+- 3 units of a product with 9: stock 9/0 to 6/3 (available/reserved), `inventory.reserved` on Kafka
+  with the order ID as key and the request's correlation ID. 6 of a product with 5: rejected with
+  `missing` 1, stock unchanged. Three lines where the highest product ID has no stock: the two lower
+  lines unchanged, the rejection names the third.
+- `order.created` published by hand with an unknown product: `product_not_found`, an error log, the
+  other line unchanged.
+- An already handled `order.created` published twice more: `reservation_duplicates_total` 2, no
+  second outbox row, stock unchanged.
+- Handler blocked on a row lock held from psql, then its connection terminated with
+  `pg_terminate_backend`: no `processed_events` row, no outbox row, and the line it had already
+  reserved was back at its previous value. The failure log carried `order_id`, `correlation_id` and
+  `product_id`. The event was redelivered 1 s later and reserved once after the lock was released.
+- Inventory SIGKILLed while its handler waited on that lock: nothing written. After `docker compose
+  start inventory` the event was processed 5 s later, once, with one `inventory.reserved` message.
+- Kafka stopped while inventory worked through a backlog of 3000 `order.created`: it handled the 438
+  it had already fetched, and 22 outcome rows stayed undispatched (gauge 22). Kafka was started 18 s
+  later. All 3000 were processed and the outbox drained within 8 s, with exactly one outcome row and
+  one Kafka message per order. aiokafka logged about 1900 connection errors while Kafka was down.
+- 3 replicas, `POST /orders` at 300/s for 60 s (18,000 orders of 1 to 4 lines over 2000 products),
+  replica 2 SIGKILLed after 25 s and started again 10 s later. Consumer lag was 0 afterwards. Over all
+  21,000 orders since the seed: no product with available + reserved different from its seeded
+  quantity, none negative, `stock_reserved` equal to the summed lines of the orders that got
+  `inventory.reserved` for every product, and exactly one outcome row and one Kafka message per
+  order. The handler averaged 2.1 to 2.4 ms per replica, 88 % of events between 1 and 3 ms.
+- `docker compose down -v`, `make up`, `make seed`: an order with stock was reserved and one over
+  stock rejected, with no manual steps.

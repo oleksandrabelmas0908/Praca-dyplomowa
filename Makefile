@@ -6,7 +6,7 @@ COMPOSE = docker compose -f infra/docker-compose.yml --project-directory .
 KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 	/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092
 # Every topic a service publishes to
-TOPICS = order.created inventory.rejected payment.completed
+TOPICS = order.created inventory.reserved inventory.rejected payment.completed
 
 # Defaults for make test, override with e.g. make test REQUESTS=200 LIMIT=50
 REQUESTS ?= 100
@@ -47,8 +47,8 @@ health:
 	@curl -sS localhost:$(CATALOG_PORT)/ready && echo
 	@curl -fsS localhost:$(ORDERS_PORT)/health && echo
 	@curl -sS localhost:$(ORDERS_PORT)/ready && echo
-	@curl -fsS localhost:$(INVENTORY_PORT)/health && echo
-	@curl -sS localhost:$(INVENTORY_PORT)/ready && echo
+	@port=$$($(COMPOSE) port inventory 8000 | sed 's/.*://'); \
+		curl -fsS localhost:$$port/health && echo && curl -sS localhost:$$port/ready && echo
 	@curl -fsS localhost:$(PAYMENTS_PORT)/health && echo
 	@curl -sS localhost:$(PAYMENTS_PORT)/ready && echo
 	@curl -fsS localhost:$(BILLING_PORT)/health && echo

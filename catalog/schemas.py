@@ -12,7 +12,6 @@ class ProductResponse(BaseModel):
     description: str
     price: Decimal
     category: str
-    stock_quantity: int
     image_paths: list[str]
     created_at: datetime
     updated_at: datetime

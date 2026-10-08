@@ -26,7 +26,7 @@ CLEANUP_BATCH_SIZE = 1000
 LAG_BUCKETS = (
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75,
     1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
-)  # fmt: skip
+)
 
 outbox_lag_seconds = Histogram(
     "outbox_lag_seconds",

@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 60
     redis_cache_url: str = ""
 
+    seed_zero_stock_fraction: float = 0.1
+
     redis_broker_url: str = ""
     celery_concurrency: int = 1
     queue_depth_interval_seconds: float = 5

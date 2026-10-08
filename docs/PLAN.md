@@ -348,3 +348,80 @@ is none. `--event-id` reuses an earlier event's ID to publish a duplicate.
 docker compose -f infra/docker-compose.yml --project-directory . exec orders \
     python -m orders.fake_events payment.completed 42 [--event-id <uuid>]
 ```
+
+## Stock (TASK-15)
+
+### Ownership
+
+Stock lives on `products` in two columns: `stock_quantity` is what is still available,
+`stock_reserved` what orders have claimed. A reservation moves units from the first to the second,
+so for every product `stock_quantity + stock_reserved` stays equal to its seeded quantity. After a
+resilience run, `SELECT sum(stock_quantity + stock_reserved) FROM products` must equal the
+`stock_total` that `make seed` logged.
+
+Stock is owned by inventory; catalog does not serve it, so cached product entries are unaffected by
+order activity. Neither column is in `ProductResponse`, no catalog endpoint filters or sorts on
+them, and a reservation leaves `updated_at` alone because catalog serves that column. If stock were
+in the cached payload, every reservation would leave the cached product stale for up to
+`CACHE_TTL_SECONDS`, the value the caching experiment sweeps, and the two experiments would be
+entangled.
+
+### Seed
+
+`make seed` gives every product 1 to 10 units (`MAX_STOCK`), then sets a share of products,
+`SEED_ZERO_STOCK_FRACTION` (default 0.1), to zero, so orders for those are rejected at any load.
+`stock_reserved` starts at 0. Both random draws happen for every product, so changing the fraction
+only moves more or fewer products to zero: names, prices, descriptions and the other stock levels
+stay the same (checked by seeding with 0.1 and 0.2).
+
+With the defaults: 100,000 products, 10,032 at zero (10.03 %), 495,578 units in total, the same on
+every run.
+
+Nothing ever returns reserved stock (payments always succeeds, and a rejected order reserves
+nothing), so stock only falls during a run and the rejection rate rises with it. Reseed before each
+measured run.
+
+### Reservation
+
+In `inventory/db.py`. `reserve(product_id, quantity)` is one conditional statement:
+
+```sql
+UPDATE products
+SET stock_quantity = stock_quantity - :quantity, stock_reserved = stock_reserved + :quantity
+WHERE id = :id AND stock_quantity >= :quantity
+RETURNING id
+```
+
+No row back means nothing was updated, and only then a second query checks whether the product
+exists, to tell `product_not_found` from `insufficient_stock`. Under Postgres' default READ
+COMMITTED, a second `UPDATE` of the same row waits for the first transaction to end and then
+re-evaluates its `WHERE` against the committed row, so the check and the decrement are one step
+without `SELECT ... FOR UPDATE`.
+
+`reserve_all(lines)` reserves the lines in product ID order inside a savepoint. When a line fails it
+rolls back to the savepoint, so none of the order's lines stay reserved, and returns that line's
+result. It runs in the caller's transaction rather than its own, so the consumer can still commit
+its `processed_events` row in the same transaction when it rejects an order. The savepoint costs
+two extra statements per order (`SAVEPOINT`, `RELEASE`).
+
+The ID order prevents deadlocks. Without it, two orders for the same two products listed in
+opposite order can each lock one row and wait for the other's.
+
+### Measured
+
+Temporary scripts against a separate seeded database, local Docker, two runs with the same result:
+
+- 20 transactions reserving 1 unit of a product with 1 left, released together by a barrier:
+  exactly one success in each of 200 rounds, and in 50 more rounds where the winner held its lock
+  for 50 ms before committing. With 3 left, exactly 3 successes in each of 100 rounds.
+- An order whose last line by ID is short or unknown returned `insufficient_stock` or
+  `product_not_found`, and its earlier lines were back at their previous values. A
+  `processed_events` row inserted before it in the same transaction was committed.
+- Two orders for the same two products in opposite line order, with a third transaction holding the
+  first product so that both queue up: both succeeded. The same interleaving without the sort
+  deadlocked, and Postgres aborted one of them after `deadlock_timeout` (1 s).
+- 5,000 orders of 2 to 6 lines over the same 6 products in random line order, 20 at a time: no
+  errors, `pg_stat_database.deadlocks` unchanged, totals exact.
+- 5,000 random orders over 300 seeded products, 2 % with an unknown product: available + reserved
+  equal to the seeded quantity for all 100,000 products, nothing negative, and the columns catalog
+  serves, `updated_at` included, unchanged.

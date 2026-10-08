@@ -15,14 +15,11 @@ from shared.db import database_url
 from shared.logging import setup_logging
 from shared.settings import settings
 
-# Sized so the table is well over Postgres' 128 MB shared_buffers, see docs/PLAN.md
 PRODUCT_COUNT = 100_000
-# Batches keep memory flat inside the catalog container
 BATCH_SIZE = 5_000
-# Experiment runs are compared across days, so every seed must produce the same catalogue.
-# For the same reason timestamps are a fixed date, not now()
 RANDOM_SEED = 5
 CREATED_AT = datetime(2026, 1, 1, tzinfo=UTC)
+MAX_STOCK = 10
 
 CATEGORIES = {
     "Electronics": ("Headphones", "Speaker", "Power Bank", "Webcam"),
@@ -58,12 +55,15 @@ def product(rng: random.Random) -> dict[str, Any]:
     category = rng.choice(list(CATEGORIES))
     name = f"{rng.choice(ADJECTIVES)} {rng.choice(CATEGORIES[category])} {rng.randint(100, 999)}"
     description = " ".join(rng.choices(SENTENCES, k=30))[: rng.randint(1_400, 1_800)]
+    stock_quantity = rng.randint(1, MAX_STOCK)
+    zero_stock = rng.random() < settings.seed_zero_stock_fraction
     return {
         "name": name,
         "description": description,
         "price": Decimal(rng.randint(199, 99_999)) / 100,
         "category": category,
-        "stock_quantity": rng.randint(0, 50),
+        "stock_quantity": 0 if zero_stock else stock_quantity,
+        "stock_reserved": 0,
         "created_at": CREATED_AT,
         "updated_at": CREATED_AT,
     }
@@ -77,9 +77,22 @@ async def main() -> None:
         await connection.execute(text("TRUNCATE products RESTART IDENTITY"))
         for _ in range(PRODUCT_COUNT // BATCH_SIZE):
             await connection.execute(insert(Product), [product(rng) for _ in range(BATCH_SIZE)])
-        rows = await connection.scalar(select(func.count()).select_from(Product))
+        counts = await connection.execute(
+            select(
+                func.count(),
+                func.count().filter(Product.stock_quantity == 0),
+                func.sum(Product.stock_quantity),
+            )
+        )
+        rows, zero_stock, stock_total = counts.one()
     await engine.dispose()
-    logger.info("products seeded", rows=rows, seconds=round(time.perf_counter() - started, 1))
+    logger.info(
+        "products seeded",
+        rows=rows,
+        zero_stock=zero_stock,
+        stock_total=stock_total,
+        seconds=round(time.perf_counter() - started, 1),
+    )
 
 
 if __name__ == "__main__":

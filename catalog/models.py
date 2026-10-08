@@ -18,6 +18,7 @@ class Product(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     category: Mapped[str] = mapped_column(Text)
     stock_quantity: Mapped[int]
+    stock_reserved: Mapped[int] = mapped_column(server_default="0")
     image_paths: Mapped[list[str]] = mapped_column(JSONB, server_default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

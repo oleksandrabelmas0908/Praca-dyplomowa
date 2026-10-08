@@ -27,8 +27,6 @@ async def set_status(session: AsyncSession, event: Event, status: OrderStatus) -
     order_id = event.payload["order_id"]
     order = await session.get(Order, order_id, with_for_update=True)
     if order is None:
-        # The outbox commits order.created together with the order, so no producer can learn an
-        # order ID that was never written. This is a bug upstream, not a race a retry would fix
         logger.error("event for unknown order", order_id=order_id)
         return order_status_transitions_rejected_total.labels("unknown_order")
     if not can_transition(order.status, status):

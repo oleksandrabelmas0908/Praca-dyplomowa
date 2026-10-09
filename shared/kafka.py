@@ -1,9 +1,15 @@
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 
 import structlog
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord, TopicPartition
+from aiokafka import (
+    AIOKafkaConsumer,
+    AIOKafkaProducer,
+    ConsumerRebalanceListener,
+    ConsumerRecord,
+    TopicPartition,
+)
 from aiokafka.errors import KafkaError
 
 from shared.events import Event, from_json, to_json
@@ -35,28 +41,55 @@ async def publish(kafka: AIOKafkaProducer, topic: str, event: Event) -> None:
 @asynccontextmanager
 async def consumer(topic: str, handler: Handler) -> AsyncIterator[None]:
     kafka = AIOKafkaConsumer(
-        topic,
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.service_name,
         enable_auto_commit=False,
         auto_offset_reset="earliest",
     )
-    await kafka.start()
     stopping = asyncio.Event()
-    task = asyncio.create_task(consume(kafka, handler, stopping))
+    partitions = PartitionTasks(kafka, handler, stopping)
+    kafka.subscribe([topic], listener=partitions)
+    await kafka.start()
     try:
         yield
     finally:
         stopping.set()
-        await task
+        await asyncio.gather(*partitions.tasks.values(), return_exceptions=True)
         await kafka.stop()
 
 
-async def consume(kafka: AIOKafkaConsumer, handler: Handler, stopping: asyncio.Event) -> None:
+class PartitionTasks(ConsumerRebalanceListener):
+    def __init__(self, kafka: AIOKafkaConsumer, handler: Handler, stopping: asyncio.Event) -> None:
+        self.kafka = kafka
+        self.handler = handler
+        self.stopping = stopping
+        self.tasks: dict[TopicPartition, asyncio.Task[None]] = {}
+
+    async def on_partitions_revoked(self, revoked: Iterable[TopicPartition]) -> None:
+        # Cancelled rather than awaited: a handler stuck on a lock would otherwise hold up the
+        # whole group's rebalance. Its transaction rolls back and the new owner redelivers the event
+        tasks = [self.tasks.pop(partition) for partition in revoked if partition in self.tasks]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def on_partitions_assigned(self, assigned: Iterable[TopicPartition]) -> None:
+        for partition in assigned:
+            self.tasks[partition] = asyncio.create_task(
+                consume(self.kafka, self.handler, partition, self.stopping)
+            )
+
+
+async def consume(
+    kafka: AIOKafkaConsumer,
+    handler: Handler,
+    partition: TopicPartition,
+    stopping: asyncio.Event,
+) -> None:
     while not stopping.is_set():
         try:
             async with asyncio.timeout(POLL_TIMEOUT_SECONDS):
-                message = await kafka.getone()
+                message = await kafka.getone(partition)
         except TimeoutError:
             continue
         await process(kafka, handler, message)

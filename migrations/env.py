@@ -7,6 +7,7 @@ from sqlalchemy.pool import NullPool
 
 import catalog.models
 import orders.models
+import payments.models
 from shared.db import Base, database_url
 from shared.logging import setup_logging
 from shared.settings import settings

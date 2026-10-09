@@ -19,6 +19,7 @@ def can_transition(current: OrderStatus, new: OrderStatus) -> bool:
     return (current, new) in {
         (OrderStatus.pending, OrderStatus.reserved),
         (OrderStatus.pending, OrderStatus.rejected),
+        (OrderStatus.pending, OrderStatus.paid),
         (OrderStatus.reserved, OrderStatus.paid),
         (OrderStatus.reserved, OrderStatus.rejected),
     }

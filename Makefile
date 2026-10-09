@@ -49,8 +49,8 @@ health:
 	@curl -sS localhost:$(ORDERS_PORT)/ready && echo
 	@port=$$($(COMPOSE) port inventory 8000 | sed 's/.*://'); \
 		curl -fsS localhost:$$port/health && echo && curl -sS localhost:$$port/ready && echo
-	@curl -fsS localhost:$(PAYMENTS_PORT)/health && echo
-	@curl -sS localhost:$(PAYMENTS_PORT)/ready && echo
+	@port=$$($(COMPOSE) port payments 8000 | sed 's/.*://'); \
+		curl -fsS localhost:$$port/health && echo && curl -sS localhost:$$port/ready && echo
 	@curl -fsS localhost:$(BILLING_PORT)/health && echo
 	@curl -sS localhost:$(BILLING_PORT)/ready && echo
 

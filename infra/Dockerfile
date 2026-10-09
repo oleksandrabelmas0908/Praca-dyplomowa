@@ -17,6 +17,7 @@ COPY migrations/ ./migrations/
 # migrations/env.py imports each service's models
 COPY catalog/ ./catalog/
 COPY orders/ ./orders/
+COPY payments/ ./payments/
 
 CMD ["alembic", "upgrade", "head"]
 

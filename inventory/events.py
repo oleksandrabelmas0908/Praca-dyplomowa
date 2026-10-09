@@ -41,7 +41,7 @@ async def on_order_created(session: AsyncSession, event: Event) -> Counter:
         outcome = Event(
             event_type="inventory.reserved",
             correlation_id=event.correlation_id,
-            payload={"order_id": order_id},
+            payload={"order_id": order_id, "total_amount": event.payload["total_amount"]},
         )
         counter = reservations_total.labels("reserved")
     else:

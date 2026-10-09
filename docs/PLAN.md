@@ -451,7 +451,7 @@ a millisecond after the outbox row's `created_at`, which is the start of the tra
 
 | Topic | Payload |
 |---|---|
-| `inventory.reserved` | `order_id` |
+| `inventory.reserved` | `order_id`, `total_amount` (copied from `order.created`, since TASK-17) |
 | `inventory.rejected` | `order_id`, `reason`, `product_id`, `requested`, `available`, `missing` |
 
 `reason` is `insufficient_stock` or `product_not_found`. For an unknown product `available` is 0
@@ -493,7 +493,8 @@ still does not apply.
 picked by Docker, so the replicas do not collide; `docker compose port --index N inventory 8000`
 finds replica N, and `make health` checks replica 1.
 All replicas join group `inventory`, so with `KAFKA_PARTITIONS=3` at most 3 consume and any further
-replica stays idle. A replica handles one event at a time.
+replica stays idle. A replica handles one event at a time per assigned partition (since TASK-17,
+one at a time in total before).
 
 ### Measured
 
@@ -525,3 +526,117 @@ Local Docker, one replica unless stated:
   order. The handler averaged 2.1 to 2.4 ms per replica, 88 % of events between 1 and 3 ms.
 - `docker compose down -v`, `make up`, `make seed`: an order with stock was reserved and one over
   stock rejected, with no manual steps.
+
+## Payments (TASK-17)
+
+### Simulated provider
+
+Payments always succeed. `PROVIDER_DELAY_SECONDS` in `payments/events.py` stands in for the round
+trip to a payment provider: **10 ms**, waited with `asyncio.sleep`. It is a constant, not a setting,
+so every run uses the same value and every paid order's end-to-end latency includes it once.
+
+The delay runs in `handle()` before the idempotent transaction opens. No pool connection or lock is
+held while it runs; inside the transaction, one handler per partition would hold 3 of the 4 pool
+connections of a replica for the whole delay. The payment's `created_at` (Postgres `now()`) is
+therefore taken after the delay. The cost is that a redelivered event waits the delay again before
+the idempotency check skips it.
+
+### Throughput cap
+
+Each partition's events are handled one at a time, so payments handles at most
+`KAFKA_PARTITIONS` / handler duration events/s, however many replicas run: about 3 / 13 ms, roughly
+225/s with 3 partitions (measured 201/s, see below). Above that the consumer lag on
+`inventory.reserved` grows without bound, and end-to-end latency measures that queue rather than
+the saga. About 70 % of orders get reserved, so 300 orders/s is about 210 payments/s, at the cap.
+Measured runs that order faster need more partitions.
+
+### Handler
+
+The consumer group is `payments`. `on_inventory_reserved` is wrapped in `@idempotent`, so the
+`processed_events` insert, the `payments` row and the `payment.completed` outbox row are one
+transaction, and the offset is committed after it.
+
+`payments.order_id` is unique, and the insert is `ON CONFLICT (order_id) DO NOTHING`. A second event
+for an order already paid, under a different `event_id` that the idempotency check cannot catch,
+commits only its `processed_events` row, logs `order already paid` at debug, and publishes nothing.
+
+`inventory.reserved` now carries `total_amount`, copied from `order.created`. Payments stores it as
+`amount` and publishes it.
+
+| Topic | Key | Payload |
+|---|---|---|
+| `payment.completed` | order ID | `order_id`, `amount` |
+
+`occurred_at` is the payment's `created_at`, the same value as the outbox row's `created_at`.
+`correlation_id` is copied from `inventory.reserved`.
+
+### Orders reaches paid
+
+Orders consumes only `inventory.rejected` and `payment.completed`, so no event moves an order to
+`reserved`. `can_transition` now also allows `pending → paid`. `reserved` stays in the enum, but no
+event sets it. The TASK-13 result "`payment.completed` for a pending order leaves it unchanged" no
+longer holds.
+
+### One task per partition
+
+`shared/kafka.py` used to fetch and handle one message at a time per consumer. A rebalance listener
+now starts one task per assigned partition and cancels those tasks when the partitions are revoked.
+Within a partition, events are still handled one at a time in offset order, with the offset
+committed after each one; partitions run concurrently. This applies to every consumer, so orders and
+inventory also handle up to `KAFKA_PARTITIONS` events at once per replica.
+
+On revoke, a partition's task is cancelled rather than awaited, because a handler blocked on a lock
+would hold up the whole group's rebalance. Its transaction rolls back, and the partition's new owner
+redelivers the event. On shutdown each task finishes the event it is handling.
+
+### Logs and metrics
+
+| Case | Log | Counted as |
+|---|---|---|
+| payment written | info `payment recorded` | `payments_total` |
+| `event_id` already in `processed_events` | debug `event already processed` | `payment_duplicates_total` |
+| order already has a payment | debug `order already paid` | `payment_duplicates_total` |
+| exception | error `handler failed, event will be redelivered` | not counted |
+
+`payment_handler_duration_seconds` covers the delay and the transaction for every attempt. Buckets
+run from 10 ms to 5 s, in 0.5 ms steps from 10 to 13 ms. Every line carries `correlation_id`, bound
+by the shared consumer, and `order_id`.
+
+### Scaling
+
+`PAYMENTS_REPLICAS` sets the number of payments containers, as for inventory, and
+`docker compose up --scale payments=N` works too. `PAYMENTS_PORT` is gone: the host port is picked
+by Docker, and `make health` checks replica 1.
+
+### Measured
+
+Local Docker, one replica unless stated:
+
+- An order with stock went `pending` → `paid` through events alone. The payment amount equalled the
+  order total, and `payment.completed` was on Kafka with the order ID as key, the request's
+  correlation ID, and `occurred_at` equal to `payments.created_at`.
+- The same `inventory.reserved` published twice more, and once with a new `event_id`: one payment,
+  one `payment.completed`, `payment_duplicates_total` 3. With `LOG_LEVEL=DEBUG` both duplicate lines
+  were logged at debug.
+- Handler blocked on an uncommitted payment row for the same order held from psql, then its
+  connection terminated with `pg_terminate_backend`: no payment, no `processed_events` row and no
+  outbox row. The error log carried `order_id` and `correlation_id`. The event was redelivered 1 s
+  later and paid once after the lock was released.
+- Payments SIGKILLed while its handler waited on that lock: nothing written. After
+  `docker compose start payments` the order was paid 5 s later, with one payment and one Kafka
+  message.
+- Kafka stopped while payments worked through a backlog of 3000 `inventory.reserved`: it handled the
+  399 it had already fetched, and 24 outcome rows stayed undispatched (gauge 24). Kafka was started
+  28 s later. All 3000 were processed and the outbox drained within 15 s, with exactly one payment,
+  one outbox row and one Kafka message per order, and every amount equal to the published one.
+- 600 events on one partition: 75/s, one at a time at 13.3 ms each. 1800 events over three
+  partitions on the same single replica: 201/s, so several events were in their delay at once. It
+  falls short of 3 × 75 because the run ends with the fullest partition.
+- 3 replicas (`--scale payments=3`), `POST /orders` at 150/s for 60 s (9000 orders of 1 to 3 random
+  products), replica 2 SIGKILLed after 25 s and started again 10 s later. Consumer lag was 0 and the
+  outbox empty 1 s after the last request. 6439 orders were paid and 2561 rejected. Every reserved
+  order had exactly one payment, with amount equal to the order total, no rejected order had one,
+  and Kafka held exactly one `payment.completed` per paid order. Handler duration on replica 3: 81 %
+  between 11.5 and 13 ms, 97 % at or under 14 ms.
+- `docker compose down -v`, `make up`, `make seed`, `make health`: an order with stock reached
+  `paid` and one over stock was `rejected`, with no manual steps.

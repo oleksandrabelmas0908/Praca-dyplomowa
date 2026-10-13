@@ -15,6 +15,7 @@ FROM base AS migrate
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
 # migrations/env.py imports each service's models
+COPY billing/ ./billing/
 COPY catalog/ ./catalog/
 COPY orders/ ./orders/
 COPY payments/ ./payments/
@@ -28,6 +29,13 @@ FROM base
 # Which service this image runs - passed in from docker-compose.yml
 ARG SERVICE
 ENV SERVICE=${SERVICE}
+
+RUN if [ "$SERVICE" = billing ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # The one service this image runs
 COPY ${SERVICE}/ ./${SERVICE}/

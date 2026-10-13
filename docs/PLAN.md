@@ -451,7 +451,7 @@ a millisecond after the outbox row's `created_at`, which is the start of the tra
 
 | Topic | Payload |
 |---|---|
-| `inventory.reserved` | `order_id`, `total_amount` (copied from `order.created`, since TASK-17) |
+| `inventory.reserved` | `order_id`, `total_amount` (copied from `order.created`, since TASK-17), `customer_id` and `lines` (copied, since TASK-19) |
 | `inventory.rejected` | `order_id`, `reason`, `product_id`, `requested`, `available`, `missing` |
 
 `reason` is `insufficient_stock` or `product_not_found`. For an unknown product `available` is 0
@@ -565,7 +565,7 @@ commits only its `processed_events` row, logs `order already paid` at debug, and
 
 | Topic | Key | Payload |
 |---|---|---|
-| `payment.completed` | order ID | `order_id`, `amount` |
+| `payment.completed` | order ID | `order_id`, `amount`, `customer_id` and `lines` (copied, since TASK-19) |
 
 `occurred_at` is the payment's `created_at`, the same value as the outbox row's `created_at`.
 `correlation_id` is copied from `inventory.reserved`.
@@ -640,3 +640,113 @@ Local Docker, one replica unless stated:
   between 11.5 and 13 ms, 97 % at or under 14 ms.
 - `docker compose down -v`, `make up`, `make seed`, `make health`: an order with stock reached
   `paid` and one over stock was `rejected`, with no manual steps.
+
+## Invoices (TASK-19)
+
+### Where billing gets the order
+
+The invoice needs the order ID, the customer, every line with product, quantity and unit price,
+and the total. Three ways to get them to billing were considered:
+
+| Approach | Cost |
+|---|---|
+| billing calls `GET /orders/{id}` when `payment.completed` arrives | an HTTP call inside an event handler: billing fails or stalls whenever orders does, and the call adds orders' latency to every invoice |
+| billing reads `orders` and `order_lines` directly | possible because every service shares one database, but billing would depend on another service's tables, and the product name is not stored there |
+| **the events carry the lines** (chosen) | the payload grows by about 100 bytes per line, and inventory and payments copy fields they do not use |
+
+The events carry them. `order.created` has the full line detail, inventory copies it into
+`inventory.reserved`, payments copies it into `payment.completed`, and billing has everything it
+needs in the one event it consumes. No handler makes a call to another service or reads another
+service's rows.
+
+The product name is read from `products` at order time, in the same query as the price, so it
+costs no extra query. An invoice is a historical document and must show the product as it was
+ordered, not as it is called after a later rename. This is the usual reason invoices embed data
+instead of referencing it. The name is only in the event; `order_lines` does not store it and
+`GET /orders` does not return it.
+
+### Payloads
+
+| Topic | Payload |
+|---|---|
+| `order.created` | `order_id`, `customer_id`, `total_amount`, `lines` |
+| `inventory.reserved` | the same four, copied from `order.created` |
+| `payment.completed` | `order_id`, `customer_id`, `amount` (equal to `total_amount`), `lines` |
+
+Each line is `product_id`, `product_name`, `quantity`, `unit_price`. Prices are JSON strings with two
+decimals, as everywhere else in the envelopes. Checked with both `DB_DRIVER=async` and `sync`: the
+lines arrived in `payment.completed` unchanged.
+
+Events published before this change have no `customer_id` or `lines`. Inventory and payments fail
+on them and redeliver them forever, so start from a clean stack (`make down`, `make up`).
+
+### Invoice table
+
+`invoices`: `id`, `order_id` (unique, one invoice per order), `invoice_number` (unique), `amount`,
+`file_path`, `created_at`. The model is `billing/models.py`, the migration
+`5b2e9a7c41d8_invoices`.
+
+`invoice_number` is `INV-{YYYYMMDD}-{order_id, 6 digits}`, for example `INV-20261013-000042`, with
+the date of the first generation in UTC. It is readable and separate from the primary key, and it
+needs no sequence: a sequence would skip a number every time a repeated run hit the unique
+constraint. Numbers are not gapless, because rejected orders get no invoice.
+
+### Rendering
+
+`generate_invoice(order_data)` in `billing/invoice.py` takes the `payment.completed` payload and
+returns the path of the PDF. `billing/invoice.html` is the template, filled with `string.Template`
+(so no template library) and rendered by WeasyPrint. It contains the invoice number, issue date,
+order ID, customer ID, one row per line with quantity, unit price and line total, and the order
+total. The table header repeats on every page; the total is printed once, after the last line.
+Product names are HTML-escaped.
+
+The function opens one transaction:
+
+1. `INSERT ... ON CONFLICT (order_id) DO UPDATE SET amount, file_path`, returning the invoice
+   number and `created_at`. On a repeat run both are kept from the first run, so the PDF gets the
+   same number and date.
+2. Render the PDF and write it over the file.
+3. Commit.
+
+The upsert's row lock is held until the commit, so two runs for the same order write the file one
+after the other. If rendering fails, the row rolls back with it. A crash after the write but before
+the commit leaves a file with no row, which the retry then overwrites.
+
+This makes the operation safe to repeat, which it has to be: Celery retries and Kafka redelivery
+both mean it can run more than once for one order. Measured: two runs one after the other, then
+two processes running it twice each at the same time, for one order: one row, one file, the
+number and `created_at` from the first run, and a complete PDF.
+
+### Files
+
+The `invoices` volume is mounted at `/invoices` in `billing`:
+
+| Path | Content |
+|---|---|
+| `/invoices/{order_id}.pdf` | the invoice of that order, overwritten on every run |
+
+There is no billing worker yet. It gets the same mount when the Celery task is added. Reading the
+file from a second container (`docker compose run --rm --no-deps billing`) with the volume mounted
+returned the same bytes.
+
+### Cost
+
+WeasyPrint needs Pango, HarfBuzz and a font, which the Dockerfile installs only when
+`SERVICE=billing` (`libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core`). The
+Python package is in `pyproject.toml` and so installed in every image, but only billing imports it.
+
+Render time inside the `billing` container (1 CPU), median of 7 runs, local Docker:
+
+| Lines | Wall | CPU | PDF |
+|---|---|---|---|
+| 1 | 24 ms | 24 ms | 9 kB |
+| 5 | 32 ms | 32 ms | 10 kB |
+| 10 | 39 ms | 39 ms | 10 kB |
+| 50 | 128 ms | 128 ms | 16 kB |
+| 100 | 251 ms | 251 ms | 24 kB |
+| 200 | 465 ms | 463 ms | 39 kB |
+| 500 | 1183 ms | 1175 ms | 84 kB |
+
+CPU time equals wall time, so rendering is CPU-bound with no waiting. It grows linearly, at about
+22 ms plus 2.3 ms per line. Orders of 1 to 4 lines therefore cost about 25 to 30 ms of CPU each,
+so one CPU saturates at roughly 35 to 40 invoices per second.

@@ -16,13 +16,13 @@ async def create_order(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> OrderResponse:
     product_ids = [line.product_id for line in order.lines]
-    prices = await async_db.get_prices(session, product_ids)
-    unknown = [product_id for product_id in product_ids if product_id not in prices]
+    products = await async_db.get_products(session, product_ids)
+    unknown = [product_id for product_id in product_ids if product_id not in products]
     if unknown:
         raise HTTPException(
             status_code=422, detail=f"unknown product_id: {', '.join(map(str, unknown))}"
         )
-    created = await async_db.create_order(session, order.customer_id, order.lines, prices)
+    created = await async_db.create_order(session, order.customer_id, order.lines, products)
     return OrderResponse.model_validate(created)
 
 

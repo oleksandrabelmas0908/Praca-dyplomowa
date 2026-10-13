@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Invoice $invoice_number</title>
+<style>
+  @page {
+    size: A4;
+    margin: 20mm 18mm 22mm;
+    font-family: "DejaVu Sans", sans-serif;
+    @bottom-left { content: "Invoice $invoice_number"; font-size: 8pt; color: #777; }
+    @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 8pt; color: #777; }
+  }
+  body { font-family: "DejaVu Sans", sans-serif; font-size: 9.5pt; color: #222; }
+  header { display: flex; justify-content: space-between; align-items: flex-start;
+           border-bottom: 2px solid #1f4e79; padding-bottom: 8mm; margin-bottom: 8mm; }
+  .shop { font-size: 16pt; font-weight: bold; color: #1f4e79; }
+  .shop small { display: block; font-size: 8.5pt; font-weight: normal; color: #555; margin-top: 2mm; }
+  h1 { margin: 0; font-size: 20pt; letter-spacing: 1pt; color: #1f4e79; text-align: right; }
+  .number { text-align: right; font-size: 10.5pt; margin-top: 2mm; }
+  dl { display: grid; grid-template-columns: max-content auto; gap: 1.5mm 6mm; margin: 0 0 8mm; }
+  dt { color: #555; }
+  dd { margin: 0; font-weight: bold; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { background: #1f4e79; color: #fff; font-weight: bold; padding: 2.5mm 2mm;
+             text-align: left; }
+  tbody td { padding: 2mm; border-bottom: 0.5pt solid #ccc; }
+  tbody tr:nth-child(even) td { background: #f2f6fa; }
+  tr { break-inside: avoid; }
+  td small { color: #777; }
+  .num { text-align: right; white-space: nowrap; }
+  .total td { border-top: 1.5pt solid #1f4e79; border-bottom: none; padding-top: 3mm;
+              font-size: 11pt; font-weight: bold; }
+</style>
+</head>
+<body>
+<header>
+  <div class="shop">Online Shop<small>Thesis test system, not a real seller</small></div>
+  <div>
+    <h1>INVOICE</h1>
+    <div class="number">$invoice_number</div>
+  </div>
+</header>
+<dl>
+  <dt>Issue date</dt><dd>$issue_date</dd>
+  <dt>Order</dt><dd>$order_id</dd>
+  <dt>Customer</dt><dd>$customer_id</dd>
+  <dt>Currency</dt><dd>PLN</dd>
+</dl>
+<table>
+  <thead>
+    <tr>
+      <th class="num">#</th><th>Product</th><th class="num">Quantity</th>
+      <th class="num">Unit price</th><th class="num">Line total</th>
+    </tr>
+  </thead>
+  <tbody>
+$rows
+  </tbody>
+  <tbody>
+    <tr class="total"><td colspan="4">Total</td><td class="num">$total</td></tr>
+  </tbody>
+</table>
+</body>
+</html>

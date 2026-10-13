@@ -54,7 +54,12 @@ async def on_inventory_reserved(session: AsyncSession, event: Event) -> Counter:
         event_type="payment.completed",
         occurred_at=payment.created_at,
         correlation_id=event.correlation_id,
-        payload={"order_id": order_id, "amount": amount},
+        payload={
+            "order_id": order_id,
+            "customer_id": event.payload["customer_id"],
+            "amount": amount,
+            "lines": event.payload["lines"],
+        },
     )
     session.add(
         OutboxEvent(

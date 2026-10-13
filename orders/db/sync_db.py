@@ -3,7 +3,7 @@
 # both
 from decimal import Decimal
 
-from sqlalchemy import Integer, Numeric, column, select, table
+from sqlalchemy import Integer, Numeric, Row, Text, column, select, table
 from sqlalchemy.orm import Session, selectinload
 
 from orders.models import Order, OrderLine
@@ -11,30 +11,41 @@ from orders.schemas import OrderLineCreate
 from shared.db import OutboxEvent
 from shared.events import Event
 
-products = table("products", column("id", Integer), column("price", Numeric(10, 2)))
+products = table(
+    "products",
+    column("id", Integer),
+    column("name", Text),
+    column("price", Numeric(10, 2)),
+)
 
 
-def get_prices(session: Session, product_ids: list[int]) -> dict[int, Decimal]:
+def get_products(
+    session: Session, product_ids: list[int]
+) -> dict[int, Row[tuple[int, Decimal, str]]]:
     result = session.execute(
-        select(products.c.id, products.c.price).where(products.c.id.in_(product_ids))
+        select(products.c.id, products.c.price, products.c.name).where(
+            products.c.id.in_(product_ids)
+        )
     )
-    return dict(result.tuples().all())
+    return {row.id: row for row in result}
 
 
 def create_order(
     session: Session,
     customer_id: int,
     lines: list[OrderLineCreate],
-    prices: dict[int, Decimal],
+    products: dict[int, Row[tuple[int, Decimal, str]]],
 ) -> Order:
     order = Order(
         customer_id=customer_id,
-        total_amount=sum((line.quantity * prices[line.product_id] for line in lines), Decimal(0)),
+        total_amount=sum(
+            (line.quantity * products[line.product_id].price for line in lines), Decimal(0)
+        ),
         lines=[
             OrderLine(
                 product_id=line.product_id,
                 quantity=line.quantity,
-                unit_price=prices[line.product_id],
+                unit_price=products[line.product_id].price,
             )
             for line in lines
         ],
@@ -51,6 +62,7 @@ def create_order(
             "lines": [
                 {
                     "product_id": line.product_id,
+                    "product_name": products[line.product_id].name,
                     "quantity": line.quantity,
                     "unit_price": line.unit_price,
                 }

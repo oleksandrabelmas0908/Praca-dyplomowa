@@ -5,6 +5,7 @@ from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+import billing.models
 import catalog.models
 import orders.models
 import payments.models

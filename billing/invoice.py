@@ -66,12 +66,17 @@ def generate_invoice(order_data: dict[str, Any]) -> Path:
                 invoice_number=invoice_number(order_id, issued_at),
                 amount=amount,
                 file_path=str(path),
-                status=InvoiceStatus.generated,
+                status=InvoiceStatus.completed,
                 created_at=issued_at,
             )
             .on_conflict_do_update(
                 index_elements=[Invoice.order_id],
-                set_={"amount": amount, "file_path": str(path), "status": InvoiceStatus.generated},
+                set_={
+                    "amount": amount,
+                    "file_path": str(path),
+                    "status": InvoiceStatus.completed,
+                    "error": None,
+                },
             )
             .returning(Invoice.invoice_number, Invoice.created_at)
         ).one()

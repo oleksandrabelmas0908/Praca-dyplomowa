@@ -392,6 +392,50 @@ services:
       start_period: 30s
       start_interval: 1s
 
+  # Same image as billing, running the Celery worker instead of Uvicorn.
+  # More workers: docker compose up --scale billing-worker=N
+  billing-worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args:
+        SERVICE: billing
+    command: ["celery", "-A", "billing.tasks", "--quiet", "worker"]
+    expose:
+      - "9000"
+    environment:
+      SERVICE_NAME: billing-worker
+      LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+      REDIS_BROKER_URL: redis://redis-broker:6379/1
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY}
+      QUEUE_DEPTH_INTERVAL_SECONDS: ${QUEUE_DEPTH_INTERVAL_SECONDS}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    volumes:
+      - invoices:/invoices
+    networks:
+      - shop
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+    cpus: 2.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A billing.tasks inspect ping --destination celery@$$HOSTNAME --timeout 5 > /dev/null"]
+      interval: 5m
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+
 networks:
   shop:
 

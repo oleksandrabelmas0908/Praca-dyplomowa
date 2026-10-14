@@ -683,7 +683,7 @@ on them and redeliver them forever, so start from a clean stack (`make down`, `m
 ### Invoice table
 
 `invoices`: `id`, `order_id` (unique, one invoice per order), `invoice_number` (unique), `amount`,
-`file_path`, `status` (`pending` or `generated`, since TASK-20), `created_at`. The model is
+`file_path`, `status` (`pending`, `completed` or `failed`, see TASK-21), `error`, `created_at`. The model is
 `billing/models.py`, the migrations `5b2e9a7c41d8_invoices` and `8d4f2a6c13e5_invoices_status`.
 
 `invoice_number` is `INV-{YYYYMMDD}-{order_id, 6 digits}`, for example `INV-20261013-000042`, with
@@ -725,8 +725,7 @@ The `invoices` volume is mounted at `/invoices` in `billing`:
 |---|---|
 | `/invoices/{order_id}.pdf` | the invoice of that order, overwritten on every run |
 
-There is no billing worker yet. It gets the same mount when the Celery task is added. Reading the
-file from a second container (`docker compose run --rm --no-deps billing`) with the volume mounted
+`billing-worker` mounts the same volume (since TASK-21). Reading the file from a second container (`docker compose run --rm --no-deps billing`) with the volume mounted
 returned the same bytes.
 
 ### Cost
@@ -760,7 +759,7 @@ publishes no events, so it has no outbox poller. `on_payment_completed` is wrapp
 the `processed_events` insert and the invoice row are one transaction. The row is written as
 `pending` with its invoice number and file path, `INSERT ... ON CONFLICT (order_id) DO NOTHING`, so
 a second event for an order already invoiced, under a different `event_id`, commits only its
-`processed_events` row and queues nothing. `generate_invoice` sets `generated` in its upsert.
+`processed_events` row and queues nothing. `generate_invoice` sets `completed` in its upsert (`generated` before TASK-21).
 
 Only after the commit does `handle()` queue `generate_invoice_pdf` with `order_id`, `customer_id`,
 `amount` and `lines` from the payload, and the event's correlation ID in the `x-correlation-id` task
@@ -769,9 +768,8 @@ row is visible, or a rollback could leave a task for an invoice that does not ex
 runs in a thread (`asyncio.to_thread`), because kombu's Redis publish blocks, and while Redis is down
 it retries for about a second, stalling the other partitions and the HTTP endpoints.
 
-The task is sent by name, `billing.tasks.generate_invoice_pdf`, from the Celery app in
-`billing/tasks.py`. The task itself and the billing worker do not exist yet: until they do, tasks
-wait in Redis. One task takes about 3 kB of broker memory, so the 128 MB broker fills after roughly
+The task is `billing.tasks.generate_invoice_pdf` in `billing/tasks.py`, run by `billing-worker`
+(TASK-21). One task takes about 3 kB of broker memory, so the 128 MB broker fills after roughly
 40,000 unconsumed tasks.
 
 `billing/tasks.py` imports `shared.celery_metrics`, so `before_task_publish` stamps `published_at`
@@ -791,8 +789,8 @@ refuses the publish, the event is already in `processed_events`. A redelivery is
 duplicate and the invoice stays `pending` with no task. Accepted: the window is the length of one
 publish, and nothing recovers it. A failed publish is logged as error `invoice task not queued,
 invoice stays pending` and not raised, so the offset is committed: redelivering would only be
-skipped. `SELECT order_id FROM invoices WHERE status = 'pending'` finds such invoices once a
-worker exists to have generated the rest.
+skipped. `SELECT order_id FROM invoices WHERE status = 'pending'` finds such invoices once the
+queue is empty.
 
 ### Logs and metrics
 
@@ -836,4 +834,83 @@ Local Docker, one billing replica, from `docker compose down -v` and `make up`:
 | 300 | 1 | 3.2 ms | 43 % | 94 % | 100 % |
 
 The duration does not follow the line count, while rendering the same orders costs 24 ms (1 line)
-and 128 ms (50 lines). The comparison with task duration in the metrics waits for the worker.
+and 128 ms (50 lines). Task duration in the worker's metrics: see TASK-21.
+
+## Invoice worker (TASK-21)
+
+### Worker
+
+`billing-worker` is the billing image running `celery -A billing.tasks worker`, like
+`catalog-worker`: prefork, `CELERY_CONCURRENCY` processes, queue `cpu` on redis-broker db 1, no
+result backend, the `invoices` volume, 2 CPUs and 1 GB. More replicas:
+`docker compose up --scale billing-worker=N`. The Celery settings are catalog's:
+`task_acks_late`, `worker_prefetch_multiplier=1` (so added replicas find the backlog still in Redis)
+and a visibility timeout of 120 s. The longest retry countdown is 32 s and a 500-line invoice
+renders in about 1.2 s, so a running task is never delivered twice.
+
+Broker check: `redis-cli config get maxmemory-policy` on redis-broker answers `noeviction`, with
+`maxmemory` 128 MB (see TASK-9).
+
+### Task
+
+`generate_invoice_pdf(order_data)` binds `correlation_id` from the `x-correlation-id` header and
+`order_id`, and calls `generate_invoice`, whose upsert sets `completed`, the file path and clears
+`error`. A repeat run overwrites `/invoices/{order_id}.pdf`, so files never accumulate. billing now
+queues it with `apply_async` instead of sending it by name.
+
+Invoice status is `pending` (row written by the consumer), `completed` or `failed`. Migration
+`2e7b9c4d5f18_invoices_failed` renames `generated` to `completed`, adds `failed` and the nullable
+`error` column.
+
+### Retries and failure
+
+`sqlalchemy.exc.OperationalError` (database unreachable) and `OSError` (volume full, unwritable
+path) are retried, up to 5 times, backoff from 2 s capped at 2, 4, 8, 16, 32 s with full jitter, as
+for images. Celery keeps the task headers on a retry, so every retry logs the same correlation ID.
+
+Any task that fails for good, after its retries or at once for any other error, sets the row to
+`failed` with `repr()` of the exception in `error`, from a `task_failure` handler. This replaces the
+dead-letter queue catalog has: `SELECT * FROM invoices WHERE status = 'failed'` lists every invoice
+that never completed. `generate_invoice` rolls back with the failure, so nothing else is left
+behind. Running the task again for a failed invoice overwrites both fields. If the database itself
+is the cause, the `failed` update fails too and the row stays `pending`.
+
+### Shared instrumentation
+
+`billing/tasks.py` imports `shared.celery_metrics` and nothing in `shared/` changed. The worker
+serves `celery_task_queue_wait_seconds`, `celery_task_duration_seconds`, `celery_tasks_total` and
+`celery_queue_depth` on `billing-worker:9000/metrics`, reachable on the `shop` network only. Billing
+has no endpoint passing it through like catalog's `GET /worker/metrics`. The TASK-10 caveat applies
+as it is: above `CELERY_CONCURRENCY=1` one child's tasks are counted. The depth gauge also reports
+`dead_letter`, always 0 here, because the shared code polls it for every worker.
+
+WeasyPrint logs seven info lines per render (`Step 1 - Fetching and parsing HTML` …), each carrying
+the correlation ID, so the worker writes about nine log lines per task.
+
+### Measured
+
+Local Docker, from `docker compose down -v` and `make up`, `CELERY_CONCURRENCY=1`:
+
+- An order of 3 lines went to `paid` and its invoice to `completed` with `/invoices/1.pdf`, through
+  events alone. The request's correlation ID was in the logs of orders, inventory, payments,
+  billing and billing-worker.
+- A directory at the invoice's file path: five retries after 1, 0, 2, 10 and 15 s, then `failed`
+  with `IsADirectoryError(21, 'Is a directory')`, all under the request's correlation ID.
+  `celery_tasks_total` counted 5 `retry` and 1 `failure`.
+- Consumption cancelled (`celery -A billing.tasks control cancel_consumer cpu`), 20 orders: the
+  depth gauge read 20, the invoices stayed `pending`, and `add_consumer cpu` drained them.
+- Worker container stopped, 20 orders: 20 tasks stayed in Redis, all completed 2.2 s after
+  `docker compose start billing-worker`, worker startup included.
+- Worker SIGKILLed while rendering a 400-line invoice: the task stayed in `unacked`, the invoice
+  `pending`. It was restored to the queue and completed 260 s after the kill, once, under its
+  correlation ID: longer than the 120 to 230 s measured for images.
+- A backlog of 1500 three-line invoices queued with consumption cancelled, then released, two runs
+  each:
+
+| Replicas | Drain time | Tasks/s |
+|---|---|---|
+| 1 | 65.3 s, 66.9 s | 23, 22 |
+| 2 | 33.6 s, 34.7 s | 45, 43 |
+| 3 | 23.8 s, 25.3 s | 63, 59 |
+
+A task took 43 ms on average, against 3 to 4 ms for the billing handler that queued it.

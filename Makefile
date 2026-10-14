@@ -12,8 +12,10 @@ TOPICS = order.created inventory.reserved inventory.rejected payment.completed
 REQUESTS ?= 100
 LIMIT ?= 1000
 IMAGES ?= 20
+ORDERS ?= 20
+LINES ?= 3
 
-.PHONY: up down obs seed health lint test test-images
+.PHONY: up down obs seed health lint test test-images test-invoices
 
 # Services start last, so the schema and the topics already exist when their consumers start.
 # An existing topic keeps its partition count, so a changed KAFKA_PARTITIONS fails here loudly
@@ -63,3 +65,7 @@ test:
 test-images:
 	python3 bench/parallel_images.py --images $(IMAGES)
 
+# ORDERS parallel orders of LINES lines to POST /orders, timed until billing-worker has generated
+# every invoice. Uses up one unit of stock per line, make seed restores it
+test-invoices:
+	python3 bench/parallel_invoices.py --orders $(ORDERS) --lines $(LINES)

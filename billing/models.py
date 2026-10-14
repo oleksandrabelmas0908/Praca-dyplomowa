@@ -1,10 +1,16 @@
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
-from sqlalchemy import DateTime, Numeric, Text, func
+from sqlalchemy import DateTime, Enum, Numeric, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from shared.db import Base
+
+
+class InvoiceStatus(StrEnum):
+    pending = "pending"
+    generated = "generated"
 
 
 class Invoice(Base):
@@ -15,4 +21,5 @@ class Invoice(Base):
     invoice_number: Mapped[str] = mapped_column(Text, unique=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     file_path: Mapped[str] = mapped_column(Text)
+    status: Mapped[InvoiceStatus] = mapped_column(Enum(InvoiceStatus, name="invoice_status"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

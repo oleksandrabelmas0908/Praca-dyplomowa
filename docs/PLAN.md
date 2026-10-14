@@ -683,11 +683,11 @@ on them and redeliver them forever, so start from a clean stack (`make down`, `m
 ### Invoice table
 
 `invoices`: `id`, `order_id` (unique, one invoice per order), `invoice_number` (unique), `amount`,
-`file_path`, `created_at`. The model is `billing/models.py`, the migration
-`5b2e9a7c41d8_invoices`.
+`file_path`, `status` (`pending` or `generated`, since TASK-20), `created_at`. The model is
+`billing/models.py`, the migrations `5b2e9a7c41d8_invoices` and `8d4f2a6c13e5_invoices_status`.
 
 `invoice_number` is `INV-{YYYYMMDD}-{order_id, 6 digits}`, for example `INV-20261013-000042`, with
-the date of the first generation in UTC. It is readable and separate from the primary key, and it
+the date the row is first written in UTC (since TASK-20 by the consumer, before the PDF exists). It is readable and separate from the primary key, and it
 needs no sequence: a sequence would skip a number every time a repeated run hit the unique
 constraint. Numbers are not gapless, because rejected orders get no invoice.
 
@@ -702,7 +702,7 @@ Product names are HTML-escaped.
 
 The function opens one transaction:
 
-1. `INSERT ... ON CONFLICT (order_id) DO UPDATE SET amount, file_path`, returning the invoice
+1. `INSERT ... ON CONFLICT (order_id) DO UPDATE SET amount, file_path, status`, returning the invoice
    number and `created_at`. On a repeat run both are kept from the first run, so the PDF gets the
    same number and date.
 2. Render the PDF and write it over the file.
@@ -750,3 +750,90 @@ Render time inside the `billing` container (1 CPU), median of 7 runs, local Dock
 CPU time equals wall time, so rendering is CPU-bound with no waiting. It grows linearly, at about
 22 ms plus 2.3 ms per line. Orders of 1 to 4 lines therefore cost about 25 to 30 ms of CPU each,
 so one CPU saturates at roughly 35 to 40 invoices per second.
+
+## Billing consumer (TASK-20)
+
+### Handler
+
+The billing lifespan starts one consumer on `payment.completed` in consumer group `billing`. Billing
+publishes no events, so it has no outbox poller. `on_payment_completed` is wrapped in `@idempotent`:
+the `processed_events` insert and the invoice row are one transaction. The row is written as
+`pending` with its invoice number and file path, `INSERT ... ON CONFLICT (order_id) DO NOTHING`, so
+a second event for an order already invoiced, under a different `event_id`, commits only its
+`processed_events` row and queues nothing. `generate_invoice` sets `generated` in its upsert.
+
+Only after the commit does `handle()` queue `generate_invoice_pdf` with `order_id`, `customer_id`,
+`amount` and `lines` from the payload, and the event's correlation ID in the `x-correlation-id` task
+header, as catalog does for images. Queued inside the transaction, a worker could start before the
+row is visible, or a rollback could leave a task for an invoice that does not exist. The publish
+runs in a thread (`asyncio.to_thread`), because kombu's Redis publish blocks, and while Redis is down
+it retries for about a second, stalling the other partitions and the HTTP endpoints.
+
+The task is sent by name, `billing.tasks.generate_invoice_pdf`, from the Celery app in
+`billing/tasks.py`. The task itself and the billing worker do not exist yet: until they do, tasks
+wait in Redis. One task takes about 3 kB of broker memory, so the 128 MB broker fills after roughly
+40,000 unconsumed tasks.
+
+`billing/tasks.py` imports `shared.celery_metrics`, so `before_task_publish` stamps `published_at`
+on every task and the worker can report queue wait.
+
+### Broker database
+
+Billing publishes to `redis://redis-broker:6379/1`, queue `cpu`. catalog-worker consumes `cpu` on
+db 0 and would take billing's tasks there, find no such task registered, and drop them. Separate db
+numbers keep the queue name from the task table and need no second instance. Flower, `make obs`,
+watches db 0 only.
+
+### Lost task after the commit
+
+The row commits before the task is queued, so if billing dies between the two, or redis-broker
+refuses the publish, the event is already in `processed_events`. A redelivery is skipped as a
+duplicate and the invoice stays `pending` with no task. Accepted: the window is the length of one
+publish, and nothing recovers it. A failed publish is logged as error `invoice task not queued,
+invoice stays pending` and not raised, so the offset is committed: redelivering would only be
+skipped. `SELECT order_id FROM invoices WHERE status = 'pending'` finds such invoices once a
+worker exists to have generated the rest.
+
+### Logs and metrics
+
+| Case | Log | Counted as |
+|---|---|---|
+| invoice row written and task queued | info `invoice requested` | `invoices_requested_total` |
+| `event_id` already in `processed_events` | debug `event already processed` | `invoice_duplicates_total` |
+| order already has an invoice | debug `order already invoiced` | `invoice_duplicates_total` |
+| task publish failed after the commit | error `invoice task not queued, invoice stays pending` | not counted |
+| exception before the commit | error `handler failed, event will be redelivered` | not counted |
+
+`invoice_handler_duration_seconds` covers the transaction and the publish, for every attempt, with
+the same buckets as inventory. Every line carries `correlation_id`, bound by the shared consumer,
+and `order_id`.
+
+### Measured
+
+Local Docker, one billing replica, from `docker compose down -v` and `make up`:
+
+- An order of 3 lines reached `paid`, its invoice was `pending` with number `INV-20261014-000001`,
+  and one message was in `cpu` on db 1, none on db 0. The message carried task
+  `billing.tasks.generate_invoice_pdf`, the order data with the lines, the request's correlation ID
+  in `x-correlation-id`, and `published_at`. `generate_invoice` run by hand on it set `generated`
+  and kept the number and `created_at`.
+- The same `payment.completed` published twice more, and once with a new `event_id`: one invoice,
+  one queued task, `invoice_duplicates_total` 3.
+- Handler blocked on an uncommitted invoice row for the same order held from psql, then its
+  connection terminated with `pg_terminate_backend`: no invoice, no `processed_events` row, no task.
+  The error log carried `order_id` and `correlation_id`. The event was redelivered and handled once
+  after the lock was released, with one task.
+- Billing SIGKILLed while its handler waited on that lock: nothing written, nothing queued. After
+  `docker compose start billing` the event was handled 2 s later, once, with one task.
+- redis-broker stopped: the invoice was committed `pending`, the publish failed within the
+  handler's 2.5 s bucket, the error was logged, the offset committed (lag 0) and no task queued.
+- Handler duration per batch, 10 orders in flight, the saga running alongside:
+
+| Orders | Lines each | Mean | ≤ 3 ms | ≤ 5 ms | ≤ 10 ms |
+|---|---|---|---|---|---|
+| 300 | 1 | 3.7 ms | 36 % | 88 % | 98 % |
+| 200 | 50 | 4.0 ms | 20 % | 82 % | 99 % |
+| 300 | 1 | 3.2 ms | 43 % | 94 % | 100 % |
+
+The duration does not follow the line count, while rendering the same orders costs 24 ms (1 line)
+and 128 ms (50 lines). The comparison with task duration in the metrics waits for the worker.

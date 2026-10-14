@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 from weasyprint import HTML
 
-from billing.models import Invoice
+from billing.models import Invoice, InvoiceStatus
 from shared.db import database_url
 
 INVOICE_DIR = Path("/invoices")
@@ -21,6 +21,14 @@ TEMPLATE = Template((Path(__file__).parent / "invoice.html").read_text())
 logger = structlog.get_logger()
 
 engine = create_engine(database_url().set(drivername="postgresql+psycopg2"), poolclass=NullPool)
+
+
+def invoice_number(order_id: int, issued_at: datetime) -> str:
+    return f"INV-{issued_at:%Y%m%d}-{order_id:06d}"
+
+
+def invoice_path(order_id: int) -> Path:
+    return INVOICE_DIR / f"{order_id}.pdf"
 
 
 def render(order_data: dict[str, Any], invoice_number: str, issued_at: datetime) -> bytes:
@@ -48,21 +56,22 @@ def render(order_data: dict[str, Any], invoice_number: str, issued_at: datetime)
 def generate_invoice(order_data: dict[str, Any]) -> Path:
     order_id = order_data["order_id"]
     amount = Decimal(order_data["amount"])
-    path = INVOICE_DIR / f"{order_id}.pdf"
+    path = invoice_path(order_id)
     issued_at = datetime.now(UTC)
     with Session(engine) as session, session.begin():
         invoice = session.execute(
             insert(Invoice)
             .values(
                 order_id=order_id,
-                invoice_number=f"INV-{issued_at:%Y%m%d}-{order_id:06d}",
+                invoice_number=invoice_number(order_id, issued_at),
                 amount=amount,
                 file_path=str(path),
+                status=InvoiceStatus.generated,
                 created_at=issued_at,
             )
             .on_conflict_do_update(
                 index_elements=[Invoice.order_id],
-                set_={"amount": amount, "file_path": str(path)},
+                set_={"amount": amount, "file_path": str(path), "status": InvoiceStatus.generated},
             )
             .returning(Invoice.invoice_number, Invoice.created_at)
         ).one()

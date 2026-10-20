@@ -233,6 +233,32 @@ services:
       start_period: 30s
       start_interval: 1s
 
+  # Scrape interval, timeout and retention: see docs/PLAN.md
+  prometheus:
+    image: prom/prometheus@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e  # v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    profiles:
+      - obs
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT}:9090"
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
   orders:
     build:
       context: .
@@ -443,5 +469,6 @@ volumes:
   postgres_data:
   kafka_data:
   redis_broker_data:
+  prometheus_data:
   images:
   invoices:

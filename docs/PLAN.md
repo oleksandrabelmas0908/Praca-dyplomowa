@@ -914,3 +914,88 @@ Local Docker, from `docker compose down -v` and `make up`, `CELERY_CONCURRENCY=1
 | 3 | 23.8 s, 25.3 s | 63, 59 |
 
 A task took 43 ms on average, against 3 to 4 ms for the billing handler that queued it.
+
+## Prometheus (TASK-23)
+
+### Container
+
+`prometheus`, v3.15.0, behind the `obs` profile with Flower: `make obs` starts both, `make up`
+neither. Configuration is `infra/prometheus/prometheus.yml` and `rules.yml`, mounted read-only;
+the time series are in the `prometheus_data` volume. The UI listens on
+`127.0.0.1:${PROMETHEUS_PORT}` only; on the server it is reached with
+`ssh -L 9090:localhost:9090`.
+
+### Scrape interval: 5 s
+
+Every target is scraped every 5 s, and the rules are evaluated every 5 s. The events the
+experiments look at, a container killed, lag building up, a worker stopped, last from seconds to
+tens of seconds, and a 30 s rate window then still holds 6 samples. A 15 s interval would leave 2
+per window, and a spike shorter than the interval would show up only smeared over the next one.
+
+The cost is small. One scrape took 3 to 10 ms and returned 6 to 20 kB (catalog the largest),
+about 830 series in total. For orders, on 1 CPU, that is roughly 0.15 % of its CPU. The longest
+scrape seen was 0.6 s, from orders during the burst and Postgres-outage tests below. Going to 1 s
+would multiply the cost by five and add no resolution the 30 s rate windows can use.
+
+The scrape timeout is 3 s. It has to be below the interval, and it is far above any scrape seen
+so far, so a timeout means the target is stuck, and it reports `up` 0.
+
+### Retention: 30 days
+
+`--storage.tsdb.retention.time=30d`. About 830 series at one sample per 5 s come to roughly
+20 MB a day, before the exporters of TASK-24 add theirs. 30 days covers re-analysing a whole
+benchmark campaign. But `make down` runs `down -v` and deletes `prometheus_data` along with every
+other volume. In practice the data lives from one `make up` to the next `make down`, so a run's
+series have to be exported before then.
+
+### Targets
+
+| Job | Discovery | Port | Instance |
+|---|---|---|---|
+| `catalog`, `orders`, `billing` | static | 8000 | `catalog:8000` |
+| `inventory`, `payments` | DNS, type A | 8000 | `<container IP>:8000` |
+| `catalog-worker`, `billing-worker` | DNS, type A | 9000 | `<container IP>:9000` |
+
+Compose DNS returns one address per container of a scaled service, and DNS discovery turns each
+into its own target, refreshed every 5 s. A static `inventory:8000` would reach one random replica
+per scrape. The three single-container services stay static, because a static target that stops
+is still listed and reports `up` 0. A stopped replica, by contrast, drops out of DNS, and its target
+disappears instead of going down. The IP changes when a container is recreated, so the instance
+label is stable only for the container's lifetime.
+
+`catalog`'s `GET /worker/metrics` is not scraped, since it would count the worker twice. The
+earlier caveats still hold: with `UVICORN_WORKERS` above 1 a scrape reaches one process, and with
+`CELERY_CONCURRENCY` above 1 one pool child.
+
+### Recording rules
+
+| Rule | Content |
+|---|---|
+| `service_endpoint:http_requests:rate30s` | requests/s by `service`, `method`, `endpoint` |
+| `service:http_requests_errors:rate30s` | 5xx responses/s by `service`, 0 for a service without one |
+| `service_endpoint:http_request_duration_seconds:p50_30s`, `p95_30s`, `p99_30s` | latency quantiles by `service`, `method`, `endpoint` |
+| `service_task:celery_task_queue_wait_seconds:p50_30s`, `p95_30s`, `p99_30s` | queue wait quantiles by `service`, `task`, `queue` |
+
+Every rule sums over the replicas of a service. The 30 s window holds 6 scrapes, so one missed
+scrape still leaves a rate. The quantiles are interpolated between bucket boundaries, so they are
+only as fine as the buckets, and they are NaN while an endpoint or task has no traffic.
+
+A labelled series appears only once a service handles its first request with those labels, so
+whatever happens before that series' first scrape is invisible to `rate()`. 300 orders sent in
+0.7 s into a fresh stack peaked at 0.55 requests/s. The warm-up before each measured run creates
+the series.
+
+### Measured
+
+Local Docker, `make down` then `make obs`:
+
+- 7 targets, all `up`. `--scale inventory=3` made 9, each inventory replica with its own
+  instance, all `up` within 12 s. The two runs below used the 3 replicas.
+- 60 s of 17 orders/s and 42 product reads/s from the client: the rules recorded 16.7 and 41.1
+  requests/s, p50 2.6 ms and p99 9.4 ms for `POST /orders`, a billing-worker queue wait p95 of
+  8 ms. Reservations ran at 6.0, 5.5 and 5.7/s on the three replicas, payments at 15.5/s (the
+  rest rejected for zero stock).
+- Postgres stopped, 40 `POST /orders` answered 500: the error rule read 1.04/s for orders and 0
+  for every other service.
+- After `make down` and `make obs`: all targets `up`, all 8 rules `ok`, retention 30d, interval
+  5 s.

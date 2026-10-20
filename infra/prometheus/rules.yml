@@ -1,0 +1,39 @@
+groups:
+  - name: http
+    rules:
+      - record: service_endpoint:http_requests:rate30s
+        expr: sum by (service, method, endpoint) (rate(http_requests_total[30s]))
+
+      # The "or" gives 0 for a service without a single 5xx, which has no 5xx series to sum
+      - record: service:http_requests_errors:rate30s
+        expr: >
+          sum by (service) (rate(http_requests_total{status=~"5.."}[30s]))
+          or sum by (service) (rate(http_requests_total[30s])) * 0
+
+      - record: service_endpoint:http_request_duration_seconds:p50_30s
+        expr: >
+          histogram_quantile(0.5,
+            sum by (service, method, endpoint, le) (rate(http_request_duration_seconds_bucket[30s])))
+      - record: service_endpoint:http_request_duration_seconds:p95_30s
+        expr: >
+          histogram_quantile(0.95,
+            sum by (service, method, endpoint, le) (rate(http_request_duration_seconds_bucket[30s])))
+      - record: service_endpoint:http_request_duration_seconds:p99_30s
+        expr: >
+          histogram_quantile(0.99,
+            sum by (service, method, endpoint, le) (rate(http_request_duration_seconds_bucket[30s])))
+
+  - name: celery
+    rules:
+      - record: service_task:celery_task_queue_wait_seconds:p50_30s
+        expr: >
+          histogram_quantile(0.5,
+            sum by (service, task, queue, le) (rate(celery_task_queue_wait_seconds_bucket[30s])))
+      - record: service_task:celery_task_queue_wait_seconds:p95_30s
+        expr: >
+          histogram_quantile(0.95,
+            sum by (service, task, queue, le) (rate(celery_task_queue_wait_seconds_bucket[30s])))
+      - record: service_task:celery_task_queue_wait_seconds:p99_30s
+        expr: >
+          histogram_quantile(0.99,
+            sum by (service, task, queue, le) (rate(celery_task_queue_wait_seconds_bucket[30s])))

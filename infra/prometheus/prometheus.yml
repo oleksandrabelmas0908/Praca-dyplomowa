@@ -45,3 +45,28 @@ scrape_configs:
         type: A
         port: 9000
         refresh_interval: 5s
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # One exporter, two targets: the Redis address goes in ?target=, and instance becomes
+  # redis-cache or redis-broker
+  - job_name: redis
+    metrics_path: /scrape
+    static_configs:
+      - targets: ["redis://redis-cache:6379", "redis://redis-broker:6379"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__address__]
+        regex: redis://(.+):6379
+        target_label: instance
+      - target_label: __address__
+        replacement: redis-exporter:9121

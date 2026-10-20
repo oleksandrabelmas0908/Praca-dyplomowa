@@ -38,7 +38,7 @@ down:
 	$(COMPOSE) --profile obs down -v
 
 obs: up
-	$(COMPOSE) --profile obs up -d --wait flower prometheus
+	$(COMPOSE) --profile obs up -d --wait flower prometheus cadvisor postgres-exporter redis-exporter kafka-exporter
 
 # Replaces the whole catalogue, so it always ends with the same products
 seed:

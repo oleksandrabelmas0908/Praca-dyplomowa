@@ -999,3 +999,133 @@ Local Docker, `make down` then `make obs`:
   for every other service.
 - After `make down` and `make obs`: all targets `up`, all 8 rules `ok`, retention 30d, interval
   5 s.
+
+## Exporters (TASK-24)
+
+### Containers
+
+| Container | Version | Job | Instance |
+|---|---|---|---|
+| `cadvisor` | v0.60.6, from `ghcr.io/google/cadvisor` (`gcr.io` stops at v0.52) | `cadvisor` | `cadvisor:8080` |
+| `postgres-exporter` | v0.20.1 | `postgres` | `postgres-exporter:9187` |
+| `redis-exporter` | v1.94.0, `-alpine` because the default image has no `wget` for the healthcheck | `redis` | `redis-cache`, `redis-broker` |
+| `kafka-exporter` | v1.10.0 | `kafka` | `kafka-exporter:9308` |
+
+All four are behind the `obs` profile, started by `make obs` and not published to the host.
+
+### cAdvisor
+
+| Flag | Why |
+|---|---|
+| `--docker_only=true` | containers plus the root cgroup, no other system cgroups |
+| `--housekeeping_interval=5s` | the scrape interval; collecting more often gives nothing Prometheus sees |
+| `--store_container_labels=false`, `--whitelisted_container_labels=com.docker.compose.service` | only the Compose service as label `container_label_com_docker_compose_service`, which groups the replicas of a service; `name` tells them apart |
+
+The Docker and containerd sockets are mounted one by one instead of `/var/run`. With Docker 29's
+containerd image store, cAdvisor's Docker support needs both. Docker Desktop does not pass the
+VM's `/var/run` through a directory mount. The paths are the same on Linux.
+
+Limits sit next to usage: `container_spec_cpu_quota / container_spec_cpu_period` is `cpus` and
+`container_spec_memory_limit_bytes` is `mem_limit`, and both matched the Compose file for every
+container.
+
+```
+sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service!=""}[30s]))
+sum by (container_label_com_docker_compose_service) (container_memory_working_set_bytes{container_label_com_docker_compose_service!=""})
+```
+
+The series without a service label are the root cgroup: the whole host (locally, the Docker
+Desktop VM) and its network interfaces.
+
+### postgres_exporter
+
+The exporter connects as `exporter`, a login role with `pg_monitor`. That role reads every
+statistics view and setting but no table (`has_table_privilege('exporter', 'products', 'SELECT')`
+is false). `infra/postgres/create-exporter-role.sh` creates it from `/docker-entrypoint-initdb.d`,
+which only runs on an empty volume, so a volume from before this change has no role until
+`make down`. The script is executable because the entrypoint executes it: on Docker Desktop it
+counts as executable regardless of its mode, and sourcing it there failed.
+
+| Signal | Metric |
+|---|---|
+| connections | `pg_stat_database_numbackends`, `pg_stat_activity_count{state}` |
+| transactions | `rate(pg_stat_database_xact_commit[30s])`, `xact_rollback` |
+| lock waits | `pg_backends_waiting_for_lock` |
+| locks held | `pg_locks_count{mode}`, `pg_stat_database_deadlocks` |
+| size | `pg_database_size_bytes` |
+
+None of the built-in collectors counts sessions waiting for a lock. `pg_locks_count` counts locks
+held, and it leaves out transaction ID locks, which are what a row lock waits on. So
+`infra/postgres/queries.yml` adds one query that counts the sessions with
+`wait_event_type = 'Lock'`. It goes through the extended queries file, which v0.20.1 marks as
+deprecated in its startup log but still runs. The other startup warning, about a missing
+`postgres_exporter.yml`, refers to auth modules, which are not used. The gauge is a snapshot at
+each scrape, so a wait that starts and ends between two scrapes is not seen.
+
+Every scrape runs the exporter's queries on the measured database: about 820 samples, 150 ms on
+average. One scrape timed out (3 s, `up` 0) while `make seed` was replacing the catalogue, because
+the seed's lock on `products` blocks the per-table size queries.
+
+### redis_exporter
+
+The exporter has no Redis address of its own. Prometheus scrapes `/scrape?target=redis://…`, once
+per instance, and relabels `instance` to `redis-cache` or `redis-broker`.
+
+| Signal | Metric |
+|---|---|
+| memory | `redis_memory_used_bytes` against `redis_memory_max_bytes` |
+| evictions | `redis_evicted_keys_total` |
+| clients | `redis_connected_clients` |
+| keyspace | `redis_db_keys{db}` |
+
+On the broker `redis_evicted_keys_total` has to stay 0, and with `noeviction` it can only change if
+the policy does. A full broker refuses new tasks instead, which shows as `redis_memory_used_bytes`
+reaching `redis_memory_max_bytes`.
+
+### kafka-exporter
+
+| Signal | Metric |
+|---|---|
+| consumer lag | `kafka_consumergroup_lag{consumergroup, topic, partition}` |
+| consumers | `kafka_consumergroup_members{consumergroup}` |
+| throughput | `rate(kafka_topic_partition_current_offset[30s])`, messages produced per partition |
+| partitions | `kafka_topic_partitions{topic}` |
+
+A group's lag appears once it has committed an offset on the partition, and it stays reported
+while every consumer of the group is stopped. Under load the lag of a healthy consumer reads 0
+to 2: messages in flight at the scrape. `__consumer_offsets` (50 partitions) is included.
+The exporter exits at startup if the broker does not answer, so it waits for Kafka to be healthy.
+
+### Cost
+
+At idle, local Docker:
+
+| Container | CPU | Memory | Scrape avg / max | Samples |
+|---|---|---|---|---|
+| `cadvisor` | 0.09 | 168 MB | 96 / 520 ms | 3232 |
+| `postgres-exporter` | 0.01 | 29 MB | 156 ms / timeout once (seed) | 823 |
+| `redis-exporter` | 0.01 | 14 MB | 49 / 256 ms, both targets | 1356 |
+| `kafka-exporter` | 0.01 | 17 MB | 136 / 515 ms | 534 |
+
+cAdvisor used 0.34 CPU in its first minute. Prometheus now holds about 7,000 series, roughly
+180 MB a day at 5 s, against about 830 before the exporters.
+
+### Measured
+
+Local Docker, `make down` then `make obs`, one replica each:
+
+- 12 targets `up`: the 7 application targets, `cadvisor`, `postgres`, `kafka`, and `redis` twice.
+- 150 s of 17 orders/s and 42 product reads/s, inventory stopped at 30 s and started at 77 s.
+  Lag of group `inventory` on `order.created`, every 10 s:
+
+| | 30 s | 40 s | 60 s | 80 s | 90 s | 100 s | 110 s |
+|---|---|---|---|---|---|---|---|
+| sum of 3 partitions | 2 | 138 | 460 | 828 | 633 | 37 | 1 |
+
+  Each partition grew alike (268 to 290 at 80 s). Production on `order.created` held at 17/s
+  throughout. Once inventory caught up, `inventory.reserved` peaked at 49 messages/s, and the
+  lag of `payments` on it at 136, both back to normal by 120 s.
+- Over the run the broker processed 18,400 commands with 0 evictions; the cache had 0 too. Up to
+  47 Postgres connections and 270 commits/s.
+- A row held with `FOR UPDATE` in one session and updated from a second:
+  `pg_backends_waiting_for_lock` read 1. It read 0 throughout the load run.

@@ -5,10 +5,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_EXPORTER_PASSWORD: ${POSTGRES_EXPORTER_PASSWORD}
     ports:
       - "127.0.0.1:${POSTGRES_PORT}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
+      - ./infra/postgres/create-exporter-role.sh:/docker-entrypoint-initdb.d/create-exporter-role.sh:ro
     networks:
       - shop
     cpus: 4.0
@@ -253,6 +255,101 @@ services:
     mem_limit: 1g
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # CPU, memory, network and disk of every container, read from the host's cgroups.
+  # privileged and /dev/kmsg as in cAdvisor's own instructions. Flags: see docs/PLAN.md
+  cadvisor:
+    image: ghcr.io/google/cadvisor@sha256:b8e7d1093144fd088f425ff003d75a4aa405de075db78dae3bc563730b1bd07a  # v0.60.6
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=5s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service
+    profiles:
+      - obs
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e  # v0.20.1
+    profiles:
+      - obs
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DATA_SOURCE_USER: exporter
+      DATA_SOURCE_PASS: ${POSTGRES_EXPORTER_PASSWORD}
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    volumes:
+      - ./infra/postgres/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9187/"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Holds no address of its own: Prometheus passes redis-cache or redis-broker as ?target=
+  redis-exporter:
+    image: oliver006/redis_exporter@sha256:2f5c00216f2142f23e6d13de341325101c31f93b8f6c3e72fe33087136bf43ec  # v1.94.0-alpine
+    profiles:
+      - obs
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9121/health"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter@sha256:346a53c2489a3530790d01f7b96632496d0d58926662f4c35bb65f569db2ab42  # v1.10.0
+    command:
+      - --kafka.server=kafka:9092
+    profiles:
+      - obs
+    networks:
+      - shop
+    # Exits at startup if the broker does not answer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9308/healthz"]
       interval: 5m
       timeout: 3s
       retries: 5

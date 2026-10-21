@@ -1341,3 +1341,70 @@ Measured after `make down` and `make up`: alembic head `a4c7e2b9f1d3` with no `i
 column, the image route and `/worker/metrics` answering 404, 50 three-line orders all reaching a
 `completed` invoice, 11 Prometheus targets `up`, and with billing-worker stopped 10 tasks waiting
 in `cpu` on db 0, read as 10 by redis-exporter.
+
+## Alerts (TASK-27)
+
+### Rules
+
+`infra/prometheus/alerts.yml`, loaded by Prometheus next to the recording rules and evaluated every
+5 s. There is no Alertmanager: an alert is `pending`, then `firing`, on Prometheus' alerts page and
+in Grafana under Alerting, data source-managed rules, and nothing is sent anywhere.
+
+| Alert | Expression | Threshold | For |
+|---|---|---|---|
+| `ConsumerLagHigh` | `sum by (consumergroup, topic) (kafka_consumergroup_lag)` | 100 messages | 1 min |
+| `ErrorRateHigh` | 5xx over all requests per service, rates over 2 min | 5 % | 1 min |
+| `CeleryQueueBacklog` | `redis_key_size{instance="redis-broker"}` | 50 tasks | 1 min |
+| `OutboxBacklog` | `max by (service) (outbox_undispatched_events)` | 50 rows | 30 s |
+
+### Thresholds
+
+Measured in two healthy 3-minute runs, 8.6 and 15.9 orders/s with 40 product reads/s, peak values:
+
+| Signal | 8.6 orders/s | 15.9 orders/s |
+|---|---|---|
+| lag, any group and topic | 3 | 3 |
+| outbox undispatched, any service | 5 | 6 |
+| billing queue depth | 0 | 0 |
+| 5xx | none | none |
+
+billing-worker used 18 % and 34 % of its 2 CPUs, so 15.9 orders/s is well below its capacity.
+
+- **Lag 100 for 1 min.** About 30 times the healthy peak, so a heavier benchmark with more messages
+  in flight stays below it. A stopped consumer at 16 orders/s passes 100 in about 6 s. The minute
+  covers catching up: after a consumer comes back the next group in the saga gets the burst (payments
+  reached 252 within 10 s of inventory restarting) and drains it in seconds. Lag is not reported
+  while Kafka itself is down, because the exporter cannot read it; the outbox rule covers that case.
+- **5xx above 5 % over 2 min, for 1 min.** A healthy run has none. At benchmark rates one transient
+  error in 2 minutes is far below 0.1 %. 5 % with a minute of hold means a sustained share of
+  failing requests. A service with almost no traffic is the weak spot: inventory and payments only
+  serve health checks, every 5 minutes, so one failed `/ready` would make 100 % of their few
+  requests and fire the rule.
+- **Queue depth 50 for 1 min.** The healthy depth is 0, because tasks start within milliseconds.
+  The minute covers bursts: inventory catching up pushed 431 tasks into the queue, which drained in
+  under a minute. It is read from redis-broker, so a dead worker still has a depth (see TASK-25).
+- **Outbox 50 for 30 s.** About eight times the healthy peak of 6, which is the 100 ms poll interval
+  times the order rate. With Kafka down the rows grow at the order rate, 16/s here, so the rule fires
+  about 30 s after the first failed publish, before lag or anything downstream shows a problem.
+
+### Measured
+
+One run under 15.9 orders/s and 40 product reads/s, each container stopped until its alert fired and
+then started again:
+
+| Stopped | Alert | Pending after | Firing after | Value when firing | Resolved after restart |
+|---|---|---|---|---|---|
+| inventory | `ConsumerLagHigh` inventory / `order.created` | 12 s | 72 s | 1,039 | 11 s |
+| billing-worker | `CeleryQueueBacklog` | (already pending) | 55 s | 1,446 | 65 s |
+| kafka | `OutboxBacklog` orders | 9 s | 45 s | 700 | 14 s |
+| postgres | `ErrorRateHigh` orders and catalog | 11 s | 75 s | 57 % | 121 s |
+
+- No alert was pending or firing in the 40 s of load before the first stop, or in either healthy run.
+- Three alerts went pending during recoveries and resolved within their hold time without firing:
+  payments' lag (252) and the queue (431) after inventory came back, and inventory's lag (675) after
+  Kafka came back.
+- With Postgres stopped, `CeleryQueueBacklog` fired as well (488 tasks), because billing-worker could
+  not write invoices and its tasks were retrying. It resolved 35 s after Postgres came back.
+- `ErrorRateHigh` takes longest to resolve, because the 2-minute rate window still holds the errors.
+- Afterwards every lag and outbox count was 0, all 11 targets were `up`, and every paid order had a
+  completed invoice, apart from those that the `make test-invoices` runs delete on cleanup.

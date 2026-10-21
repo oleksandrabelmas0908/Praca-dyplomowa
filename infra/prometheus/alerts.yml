@@ -1,0 +1,31 @@
+# Evaluated by Prometheus and listed on its alerts page and in Grafana; nothing sends them anywhere.
+# Thresholds and how they were chosen: see docs/PLAN.md
+groups:
+  - name: alerts
+    rules:
+      - alert: ConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100
+        for: 1m
+        annotations:
+          summary: "{{ $labels.consumergroup }} is {{ $value }} messages behind on {{ $labels.topic }}"
+
+      - alert: ErrorRateHigh
+        expr: >
+          sum by (service) (rate(http_requests_total{status=~"5.."}[2m]))
+          / sum by (service) (rate(http_requests_total[2m])) > 0.05
+        for: 1m
+        annotations:
+          summary: "{{ $labels.service }} answers {{ $value | humanizePercentage }} of requests with 5xx"
+
+      # From redis-broker rather than the worker's own gauge, which stops when the worker does
+      - alert: CeleryQueueBacklog
+        expr: redis_key_size{instance="redis-broker"} > 50
+        for: 1m
+        annotations:
+          summary: "{{ $value }} tasks waiting in {{ $labels.key }}"
+
+      - alert: OutboxBacklog
+        expr: max by (service) (outbox_undispatched_events) > 50
+        for: 30s
+        annotations:
+          summary: "{{ $labels.service }} has {{ $value }} outbox rows not yet published to Kafka"

@@ -1,7 +1,10 @@
 include .env
 export
 
-COMPOSE = docker compose -f infra/docker-compose.yml --project-directory .
+OBS ?= true
+APP_FILES = -f infra/docker-compose.yml
+ALL_FILES = $(APP_FILES) -f infra/docker-compose.obs.yml
+COMPOSE = docker compose $(if $(filter true,$(OBS)),$(ALL_FILES),$(APP_FILES)) --project-directory .
 # Small heap of its own, because the broker's KAFKA_HEAP_OPTS would give this JVM 512m too
 KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 	/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092
@@ -17,6 +20,7 @@ LINES ?= 3
 
 .PHONY: up down obs seed health lint test test-images test-invoices
 
+# OBS=false leaves out infra/docker-compose.obs.yml and removes its containers if they are running.
 # Services start last, so the schema and the topics already exist when their consumers start.
 # An existing topic keeps its partition count, so a changed KAFKA_PARTITIONS fails here loudly
 up:
@@ -32,15 +36,15 @@ up:
 				"recreate it with a clean stack (docker compose down -v)"; \
 			exit 1; }; \
 	done
-	$(COMPOSE) up -d --wait
+	$(COMPOSE) up -d --wait --remove-orphans
 
+# Both files whatever OBS is, so monitoring containers and volumes go too
 down:
-	$(COMPOSE) --profile obs down -v
+	docker compose $(ALL_FILES) --project-directory . down -v
 
-obs: up
-	$(COMPOSE) --profile obs build loki
-	$(COMPOSE) --profile obs up -d --wait flower prometheus grafana loki alloy cadvisor postgres-exporter \
-		redis-exporter kafka-exporter
+# make up with monitoring, whatever OBS is in .env
+obs:
+	$(MAKE) up OBS=true
 
 # Replaces the whole catalogue, so it always ends with the same products
 seed:

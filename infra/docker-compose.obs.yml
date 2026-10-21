@@ -1,0 +1,214 @@
+# Monitoring: Flower, Prometheus, Grafana, Loki, Alloy, cAdvisor and the exporters. make adds this
+# file to docker-compose.yml when OBS=true. It uses that file's network and services, so it is
+# never started on its own
+services:
+  # Switches task events on in every worker, which adds broker traffic to the measurements.
+  # See docs/PLAN.md
+  flower:
+    image: mher/flower@sha256:2bcb4764c034aafb70747d4eb9ca8642d29260d4bd2089e70327fa3421a054d9  # 2.2.0
+    command: ["celery", "--broker=redis://redis-broker:6379/0", "flower"]
+    ports:
+      - "127.0.0.1:${FLOWER_PORT}:5555"
+    networks:
+      - shop
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5555/healthcheck')"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Scrape interval, timeout and retention: see docs/PLAN.md
+  prometheus:
+    image: prom/prometheus@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e  # v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT}:9090"
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  loki:
+    build:
+      context: infra/loki
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./infra/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://localhost:3100/ready"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Reads every container's log through the Docker API and pushes it to Loki; docker compose logs
+  # keeps working because the logging driver stays json-file. The socket is read-only: a writable
+  # one is root on the host
+  alloy:
+    image: grafana/alloy@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f  # v1.20.1
+    environment:
+      # Only this project's containers, not anything else running on the same Docker
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - ./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # How far each container's log has been read. Without it a recreated Alloy sends every log
+      # from the start again
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    # The image has bash but no HTTP client
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/12345 && printf 'GET /-/ready HTTP/1.0\r\n\r\n' >&3 && grep -q ' 200 ' <&3"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # CPU, memory, network and disk of every container, read from the host's cgroups.
+  # privileged and /dev/kmsg as in cAdvisor's own instructions. Flags: see docs/PLAN.md
+  cadvisor:
+    image: ghcr.io/google/cadvisor@sha256:b8e7d1093144fd088f425ff003d75a4aa405de075db78dae3bc563730b1bd07a  # v0.60.6
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=5s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Datasource and dashboards come from infra/grafana only. No volume: nothing Grafana stores
+  # itself is worth keeping
+  grafana:
+    image: grafana/grafana@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f  # 13.2.4
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards:ro
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e  # v0.20.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DATA_SOURCE_USER: exporter
+      DATA_SOURCE_PASS: ${POSTGRES_EXPORTER_PASSWORD}
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    volumes:
+      - ./infra/postgres/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9187/"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Holds no address of its own: Prometheus passes redis-cache or redis-broker as ?target=
+  redis-exporter:
+    image: oliver006/redis_exporter@sha256:2f5c00216f2142f23e6d13de341325101c31f93b8f6c3e72fe33087136bf43ec  # v1.94.0-alpine
+    # LLEN of the Celery queues, catalog's on db 0 and billing's on db 1, readable while a
+    # worker is down (the worker's own celery_queue_depth is not)
+    command: ["--check-single-keys=db0=cpu,db0=dead_letter,db1=cpu"]
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9121/health"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter@sha256:346a53c2489a3530790d01f7b96632496d0d58926662f4c35bb65f569db2ab42  # v1.10.0
+    command:
+      - --kafka.server=kafka:9092
+    networks:
+      - shop
+    # Exits at startup if the broker does not answer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    cpus: 0.5
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9308/healthz"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+volumes:
+  prometheus_data:
+  loki_data:
+  alloy_data:

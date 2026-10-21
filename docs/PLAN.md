@@ -1312,3 +1312,35 @@ Local Docker, `make down` then `make obs`:
 - `--scale inventory=3` under 60 s of load: 326, 360 and 337 lines from `pracadyplomowa-inventory-1`,
   `-2` and `-3`.
 - Loki at 1.4 % of a CPU and 87 MB, Alloy at 2.6 % and 68 MB, during that load.
+
+## Compose files and OBS
+
+The stack is split in two files:
+
+| File | Content |
+|---|---|
+| `infra/docker-compose.yml` | Postgres, Kafka, both Redis, the migrations, the five services and both workers, the `shop` network and the application volumes |
+| `infra/docker-compose.obs.yml` | Flower, Prometheus, Grafana, Loki, Alloy, cAdvisor and the three exporters, with `prometheus_data`, `loki_data` and `alloy_data` |
+
+The monitoring file uses the network and services of the first, so it is only ever used together
+with it. The `obs` profile is gone: what the sections above call "behind the `obs` profile" now
+means "in `docker-compose.obs.yml`". Merged, the two files give the same configuration as the
+single file did with `--profile obs` (`docker compose config` compared, minus the `profiles`
+lines).
+
+`OBS` in `.env`, `true` by default, picks the files for every make target:
+
+| Command | Files |
+|---|---|
+| `make up` with `OBS=true` | both: the application and the monitoring |
+| `make up` with `OBS=false`, or `make up OBS=false` | the application only. Monitoring containers left running are removed (`--remove-orphans`); their volumes stay |
+| `make obs` | `make up OBS=true`, whatever `.env` says |
+| `make down` | both, always, so every container and volume goes |
+
+Only the exact value `true` includes the monitoring; anything else, `True` included, leaves it
+out.
+
+Flower now starts with every `make up` while `OBS=true`, and it switches task events on in every
+worker (see TASK-9). A measured run with monitoring therefore includes that broker traffic, and a
+run with `OBS=false` does not. With `OBS=false` the `exporter` Postgres role still exists, because
+Postgres creates it on an empty volume whichever files are used.

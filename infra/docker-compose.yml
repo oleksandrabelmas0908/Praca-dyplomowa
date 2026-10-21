@@ -261,6 +261,56 @@ services:
       start_period: 30s
       start_interval: 1s
 
+  loki:
+    build:
+      context: infra/loki
+    command: ["-config.file=/etc/loki/loki.yml"]
+    profiles:
+      - obs
+    volumes:
+      - ./infra/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://localhost:3100/ready"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # Reads every container's log through the Docker API and pushes it to Loki; docker compose logs
+  # keeps working because the logging driver stays json-file. The socket is read-only: a writable
+  # one is root on the host
+  alloy:
+    image: grafana/alloy@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f  # v1.20.1
+    profiles:
+      - obs
+    environment:
+      # Only this project's containers, not anything else running on the same Docker
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - ./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # How far each container's log has been read. Without it a recreated Alloy sends every log
+      # from the start again
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - shop
+    cpus: 0.5
+    mem_limit: 256m
+    # The image has bash but no HTTP client
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/12345 && printf 'GET /-/ready HTTP/1.0\r\n\r\n' >&3 && grep -q ' 200 ' <&3"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
   # CPU, memory, network and disk of every container, read from the host's cgroups.
   # privileged and /dev/kmsg as in cAdvisor's own instructions. Flags: see docs/PLAN.md
   cadvisor:
@@ -596,5 +646,7 @@ volumes:
   kafka_data:
   redis_broker_data:
   prometheus_data:
+  loki_data:
+  alloy_data:
   images:
   invoices:

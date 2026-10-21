@@ -1214,3 +1214,101 @@ Local Docker, `make down` then `make obs`, `CELERY_CONCURRENCY=5`:
   bottleneck, and the Resources dashboard shows it at its CPU limit.
 - After `make down` and `make obs` the four dashboards returned by the API were identical to
   those before, apart from `id` and `version`.
+
+## Logs (TASK-26)
+
+### Containers
+
+| Container | Version | Role |
+|---|---|---|
+| `loki` | 3.7.9, built from `infra/loki/Dockerfile` | stores logs on the `loki_data` volume, not published to the host |
+| `alloy` | v1.20.1 | reads every container's log through the Docker API and pushes it to Loki |
+
+Both are behind the `obs` profile, and `make obs` builds the Loki image before starting them. The
+Loki image is distroless, with no shell or HTTP client, so the Dockerfile copies a static busybox
+(1.36.1-musl) to `/busybox` for the healthcheck's `wget`. Alloy's image has bash but no HTTP
+client, so its healthcheck sends `GET /-/ready` through bash's `/dev/tcp`.
+
+Containers keep Docker's `json-file` logging driver, so `docker compose logs` works as before. Alloy
+mounts the Docker socket read-only, since it only lists containers and reads their logs; a
+writable socket is root on the host. The `alloy_data` volume holds how far each log has been read.
+Without it a recreated Alloy sent every log from the start again, doubling the stored lines
+(17,520 to 32,925). With it, a recreate sent nothing twice.
+
+### Collection
+
+`infra/alloy/config.alloy`: `discovery.docker` lists the containers with label
+`com.docker.compose.project` equal to the project name every 5 s, so a replica added with
+`--scale` is picked up within 5 s and other projects on the same Docker are left out. The project
+name reaches Alloy as `COMPOSE_PROJECT`, from Compose's `COMPOSE_PROJECT_NAME`. `cadvisor` and the
+`*-exporter` containers are dropped. Everything else is collected, the observability containers
+included.
+
+### Labels and fields
+
+| Where | Fields |
+|---|---|
+| labels (one stream per combination) | `service` (Compose service), `container` (container name, e.g. `pracadyplomowa-inventory-2`) |
+| structured metadata, parsed by Alloy | `level`, `correlation_id`, `order_id` |
+| line, unchanged | the whole JSON, every other field |
+
+The correlation ID and order ID are one value per request, so as labels they would make one stream
+per request. As structured metadata they are stored next to each line and filtered without
+parsing: `{service=~".+"} | correlation_id="…"` and `| level="error"` need no `| json`. Other
+fields (`event`, `status`, `duration_ms`, `product_id` …) are read with `| json` at query time.
+Lines that are not JSON (Postgres, Celery's start and stop banners) are kept without the three
+fields.
+
+Loki 3 would add a `service_name` label and a `detected_level` field by itself. Both are switched
+off (`discover_service_name: []`, `discover_log_levels: false`), so the labels are exactly the two
+above. When Loki's API returns a stream, it lists structured metadata next to the labels;
+`/loki/api/v1/labels` answers `container` and `service` only.
+
+### Retention: 7 days
+
+`retention_period: 168h`, applied by the compactor (`retention_enabled: true`). Logs answer what
+went wrong in a run, which is asked soon after the run; the results come from Prometheus, kept for
+30 days. At 17 orders/s and 42 product reads/s Loki received 245 lines/s, 79 KiB/s before
+compression, about 6.6 GB a day under continuous load. As for Prometheus, `make down` deletes
+`loki_data`, so in practice the logs last until the next `make down`.
+
+Loki's default per-tenant limit is 4 MB/s, which at 331 bytes per line is about 12,000 lines/s.
+Above that Loki rejects pushes, Alloy retries, and lines arrive late or are dropped.
+
+### Where the lines come from
+
+Lines in 65 s of that load: billing-worker 8,842, catalog 2,470, orders 1,981, inventory 1,022,
+payments 897, billing 896. billing-worker writes about 9 lines per invoice, 7 of them WeasyPrint's
+render steps (see TASK-21). Every service also logs a `request` line for each Prometheus scrape of
+`/metrics`, one per service every 5 s.
+
+### Trace in Grafana
+
+Loki is provisioned as a second datasource (uid `loki`). The `Order trace` dashboard has a
+Correlation ID text box and one logs panel, oldest line first, over the last hour:
+
+```
+{service=~".+"} | correlation_id!="" | correlation_id="$correlation_id"
+```
+
+The `!= ""` makes an empty box match nothing instead of every line without an ID. The dashboard does
+not refresh on its own, because a trace does not change once the order has finished.
+
+The correlation ID is the `x-correlation-id` response header of `POST /orders`. catalog and
+catalog-worker are not on an order's path, since orders reads prices from `products` directly. An
+image upload traces through them instead.
+
+### Measured
+
+Local Docker, `make down` then `make obs`:
+
+- `/loki/api/v1/label/service/values`: every service except cadvisor and the exporters.
+- One order of 2 lines, by its correlation ID: 14 lines from 6 containers, in order. orders
+  `request` 0 ms, inventory `stock reserved` 105 ms, payments `payment recorded` 210 ms, orders
+  `order status changed` 303 ms, billing `invoice requested` 313 ms, billing-worker 9 lines to
+  `succeeded` at 453 ms. Every line after the first carried `order_id` 1.
+- An image upload: catalog `request`, then catalog-worker `product image processed` and
+  `succeeded`, 82 ms apart.
+- `--scale inventory=3` under 60 s of load: 326, 360 and 337 lines from `pracadyplomowa-inventory-1`,
+  `-2` and `-3`.
+- Loki at 1.4 % of a CPU and 87 MB, Alloy at 2.6 % and 68 MB, during that load.

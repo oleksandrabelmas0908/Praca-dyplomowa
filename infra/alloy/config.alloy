@@ -1,0 +1,69 @@
+// Every container of this Compose project, found through the Docker socket, so scaled replicas
+// are picked up as they start
+discovery.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "5s"
+
+	filter {
+		name   = "label"
+		values = ["com.docker.compose.project=" + sys.env("COMPOSE_PROJECT")]
+	}
+}
+
+// Labels: service and container, nothing else. Each label combination is a stream, so the
+// correlation ID and order ID stay in the line and in structured metadata
+discovery.relabel "containers" {
+	targets = discovery.docker.containers.targets
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		regex         = "cadvisor|.*-exporter"
+		action        = "drop"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+}
+
+loki.source.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	targets          = discovery.relabel.containers.output
+	refresh_interval = "5s"
+	forward_to       = [loki.process.json.receiver]
+}
+
+// Fields parsed once here and stored as structured metadata, so a query filters on them without
+// | json. Lines that are not JSON (Postgres, Celery's banners) pass through without them
+loki.process "json" {
+	forward_to = [loki.write.loki.receiver]
+
+	stage.json {
+		expressions = {
+			level          = "",
+			correlation_id = "",
+			order_id       = "",
+		}
+	}
+
+	stage.structured_metadata {
+		values = {
+			level          = "",
+			correlation_id = "",
+			order_id       = "",
+		}
+	}
+}
+
+loki.write "loki" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

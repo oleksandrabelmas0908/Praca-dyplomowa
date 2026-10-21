@@ -1,0 +1,70 @@
+{
+  "uid": "trace",
+  "title": "Order trace",
+  "tags": [
+    "shop"
+  ],
+  "editable": false,
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "correlation_id",
+        "label": "Correlation ID",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "logs",
+      "title": "Every line with this correlation ID, oldest first",
+      "description": "Paste the x-correlation-id of a request. Labels are service and container; level, correlation_id and order_id are structured metadata.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{service=~\".+\"} | correlation_id!=\"\" | correlation_id=\"$correlation_id\"",
+          "queryType": "range",
+          "maxLines": 5000
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Ascending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false
+      }
+    }
+  ]
+}

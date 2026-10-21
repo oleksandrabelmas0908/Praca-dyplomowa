@@ -12,7 +12,6 @@ class ProductResponse(BaseModel):
     description: str
     price: Decimal
     category: str
-    image_paths: list[str]
     created_at: datetime
     updated_at: datetime
 
@@ -28,8 +27,3 @@ class ProductUpdate(BaseModel):
     price: Decimal | None = None
     category: str | None = None
     stock_quantity: int | None = None
-
-
-class ImageUploadResponse(BaseModel):
-    product_id: int
-    status: str

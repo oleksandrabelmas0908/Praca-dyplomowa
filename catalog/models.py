@@ -2,7 +2,6 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import DateTime, Index, Numeric, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from shared.db import Base
@@ -19,7 +18,6 @@ class Product(Base):
     category: Mapped[str] = mapped_column(Text)
     stock_quantity: Mapped[int]
     stock_reserved: Mapped[int] = mapped_column(server_default="0")
-    image_paths: Mapped[list[str]] = mapped_column(JSONB, server_default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

@@ -23,7 +23,7 @@
     {
       "type": "timeseries",
       "title": "Queue depth",
-      "description": "LLEN of each queue, read from redis-broker by redis-exporter, so it keeps reporting while a worker is down. db 0 is catalog, db 1 billing.",
+      "description": "LLEN of billing's queue, read from redis-broker by redis-exporter, so it keeps reporting while the worker is down.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -40,18 +40,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "redis_key_size{instance=\"redis-broker\", db=\"db0\"}",
-          "legendFormat": "catalog-worker {{key}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "redis_key_size{instance=\"redis-broker\", db=\"db1\"}",
+          "expr": "redis_key_size{instance=\"redis-broker\", db=\"db0\", key=\"cpu\"}",
           "legendFormat": "billing-worker {{key}}",
-          "refId": "B"
+          "refId": "A"
         }
       ],
       "fieldConfig": {

@@ -16,8 +16,6 @@ dependencies = [
     "aiokafka==0.14.0",
     # Without the [redis] extra: kombu's extra caps redis-py below 6.5, the pin above is 8.1
     "celery==5.6.3",
-    "pillow==12.3.0",
-    "python-multipart==0.0.32",
     "weasyprint==70.0",
 ]
 

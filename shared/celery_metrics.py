@@ -12,11 +12,10 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from shared.metrics import WithServiceLabel
 from shared.settings import settings
 
-DEAD_LETTER_QUEUE = "dead_letter"
 PUBLISHED_AT = "published_at"
 METRICS_PORT = 9000
 
-# Image processing takes hundreds of milliseconds to seconds, the 600 px test image about 20 ms
+# An invoice renders in tens of milliseconds for a few lines and about 1.2 s for 500
 DURATION_BUCKETS = (
     0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75,
     1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 20.0, 30.0,
@@ -117,5 +116,5 @@ def start_metrics_server(**_: Any) -> None:
         if error.errno != errno.EADDRINUSE:
             raise
         return
-    queues = [*current_app.amqp.queues, DEAD_LETTER_QUEUE]
+    queues = list(current_app.amqp.queues)
     threading.Thread(target=poll_queue_depth, args=(queues,), daemon=True).start()

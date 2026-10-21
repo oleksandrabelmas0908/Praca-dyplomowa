@@ -141,11 +141,7 @@ services:
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS}
       SEED_ZERO_STOCK_FRACTION: ${SEED_ZERO_STOCK_FRACTION}
       REDIS_CACHE_URL: redis://redis-cache:6379/0
-      REDIS_BROKER_URL: redis://redis-broker:6379/0
-      WORKER_METRICS_URL: http://catalog-worker:9000/metrics
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-    volumes:
-      - images:/images
     networks:
       - shop
     depends_on:
@@ -154,8 +150,6 @@ services:
       kafka:
         condition: service_healthy
       redis-cache:
-        condition: service_healthy
-      redis-broker:
         condition: service_healthy
     cpus: 4.0
     mem_limit: 4g
@@ -166,50 +160,6 @@ services:
       retries: 5
       start_period: 30s
       start_interval: 1s
-
-  # Same image as catalog, running the Celery worker instead of Uvicorn.
-  # More workers: docker compose up --scale catalog-worker=N
-  catalog-worker:
-    build:
-      context: .
-      dockerfile: infra/Dockerfile
-      args:
-        SERVICE: catalog
-    command: ["celery", "-A", "catalog.tasks", "--quiet", "worker"]
-    expose:
-      - "9000"
-    environment:
-      SERVICE_NAME: catalog-worker
-      LOG_LEVEL: ${LOG_LEVEL}
-      ENV: ${ENV}
-      POSTGRES_HOST: postgres
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      DB_POOL_SIZE: ${DB_POOL_SIZE}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
-      REDIS_BROKER_URL: redis://redis-broker:6379/0
-      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY}
-      QUEUE_DEPTH_INTERVAL_SECONDS: ${QUEUE_DEPTH_INTERVAL_SECONDS}
-      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-    volumes:
-      - images:/images
-    networks:
-      - shop
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis-broker:
-        condition: service_healthy
-    cpus: 2.0
-    mem_limit: 1g
-    healthcheck:
-      test: ["CMD-SHELL", "celery -A catalog.tasks inspect ping --destination celery@$$HOSTNAME --timeout 5 > /dev/null"]
-      interval: 5m
-      timeout: 15s
-      retries: 5
-      start_period: 30s
-      start_interval: 2s
 
   orders:
     build:
@@ -347,8 +297,7 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-      # db 1: catalog-worker consumes queue cpu on db 0 and would drop billing's tasks as unknown
-      REDIS_BROKER_URL: redis://redis-broker:6379/1
+      REDIS_BROKER_URL: redis://redis-broker:6379/0
     volumes:
       - invoices:/invoices
     networks:
@@ -391,7 +340,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       DB_POOL_SIZE: ${DB_POOL_SIZE}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
-      REDIS_BROKER_URL: redis://redis-broker:6379/1
+      REDIS_BROKER_URL: redis://redis-broker:6379/0
       CELERY_CONCURRENCY: ${CELERY_CONCURRENCY}
       QUEUE_DEPTH_INTERVAL_SECONDS: ${QUEUE_DEPTH_INTERVAL_SECONDS}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
@@ -421,5 +370,4 @@ volumes:
   postgres_data:
   kafka_data:
   redis_broker_data:
-  images:
   invoices:

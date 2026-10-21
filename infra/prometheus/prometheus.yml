@@ -33,12 +33,6 @@ scrape_configs:
         type: A
         port: 8000
         refresh_interval: 5s
-  - job_name: catalog-worker
-    dns_sd_configs:
-      - names: ["catalog-worker"]
-        type: A
-        port: 9000
-        refresh_interval: 5s
   - job_name: billing-worker
     dns_sd_configs:
       - names: ["billing-worker"]

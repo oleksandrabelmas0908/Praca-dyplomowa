@@ -1,4 +1,3 @@
-import urllib.request
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -8,15 +7,13 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from catalog import cache
-from catalog.routes import async_routes, image_routes, sync_routes
+from catalog.routes import async_routes, sync_routes
 from shared.db import database_ready
 from shared.db import lifespan as db_lifespan
 from shared.logging import setup_logging
 from shared.metrics import CONTENT_TYPE, generate_metrics
 from shared.middleware import CorrelationId
 from shared.settings import settings
-
-WORKER_METRICS_TIMEOUT_SECONDS = 5
 
 setup_logging(settings.service_name, settings.log_level)
 logger = structlog.get_logger()
@@ -39,7 +36,6 @@ app.add_middleware(CorrelationId)
 
 catalog_router = sync_routes.router if settings.db_driver == "sync" else async_routes.router
 app.include_router(catalog_router, prefix="/catalog", tags=["catalog"])
-app.include_router(image_routes.router, prefix="/catalog", tags=["catalog"])
 logger.info("database driver", driver=settings.db_driver)
 
 
@@ -61,11 +57,3 @@ async def ready(request: Request) -> JSONResponse:
 @app.get("/metrics")
 async def metrics() -> Response:
     return Response(generate_metrics(), media_type=CONTENT_TYPE)
-
-
-@app.get("/worker/metrics")
-def worker_metrics() -> Response:
-    with urllib.request.urlopen(
-        settings.worker_metrics_url, timeout=WORKER_METRICS_TIMEOUT_SECONDS
-    ) as response:
-        return Response(response.read(), media_type=CONTENT_TYPE)

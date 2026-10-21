@@ -14,11 +14,10 @@ TOPICS = order.created inventory.reserved inventory.rejected payment.completed
 # Defaults for make test, override with e.g. make test REQUESTS=200 LIMIT=50
 REQUESTS ?= 100
 LIMIT ?= 1000
-IMAGES ?= 20
 ORDERS ?= 20
 LINES ?= 3
 
-.PHONY: up down obs seed health lint test test-images test-invoices
+.PHONY: up down obs seed health lint test test-invoices
 
 # OBS=false leaves out infra/docker-compose.obs.yml and removes its containers if they are running.
 # Services start last, so the schema and the topics already exist when their consumers start.
@@ -65,11 +64,6 @@ health:
 # REQUESTS parallel requests to GET /catalog/products?limit=LIMIT, with server and client times
 test:
 	python3 bench/parallel_products.py --requests $(REQUESTS) --limit $(LIMIT)
-
-# IMAGES parallel uploads to POST /catalog/products/{id}/image, timed until catalog-worker has
-# processed them all, then every image is deleted
-test-images:
-	python3 bench/parallel_images.py --images $(IMAGES)
 
 # ORDERS parallel orders of LINES lines to POST /orders, timed until billing-worker has generated
 # every invoice. Uses up one unit of stock per line, make seed restores it

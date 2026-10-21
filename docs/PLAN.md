@@ -60,7 +60,7 @@ The staleness this allows:
 With `CACHE_ENABLED=false`, no Redis client is created, so there is no connection and no round
 trip, and the handlers run the same database path as before the cache existed.
 
-## Image worker (TASK-9)
+## Celery broker (TASK-9)
 
 ### Two Redis instances
 
@@ -72,68 +72,50 @@ trip, and the handlers run the same database path as before the cache existed.
 | Persistence | none | append-only file, fsync every second, named volume |
 
 The two need opposite behaviour when memory runs out. A cache that drops keys just takes a few
-extra database reads. A broker that drops keys silently loses tasks, so the request that queued
-them got a 202 for work that will never run. With `noeviction` a full broker refuses writes:
-the publish raises `command not allowed when used memory > 'maxmemory'`, the upload returns 500,
-and every task already queued stays. Measured by filling the broker to 128 MB: the publish was
-refused, `evicted_keys` stayed 0, and the 7 queued tasks were all processed afterwards.
+extra database reads. A broker that drops keys silently loses tasks, which were accepted and will
+never run. With `noeviction` a full broker refuses writes: the publish raises
+`command not allowed when used memory > 'maxmemory'`, and every task already queued stays. For
+billing a refused publish leaves the invoice `pending` (see TASK-20). Measured by filling the
+broker to 128 MB: the publish was refused, `evicted_keys` stayed 0, and the 7 tasks already queued
+were all processed afterwards.
 
-One queued image task takes about 1.2 kB, so 128 MB holds about 110,000 queued tasks. Redis does
-not count its append-only file buffer against `maxmemory`, and rewriting that file forks the
-process, so the container limit is 512 MB.
+A queued invoice task of 3 lines takes about 1.65 kB (100 queued: 165,498 bytes), so 128 MB holds
+about 81,000; a task carries its order lines, so longer invoices take more. Redis does not count
+its append-only file buffer against `maxmemory`, and rewriting that file forks the process, so the
+container limit is 512 MB.
 
 ### Delivery guarantees
 
 - `task_acks_late`: a task is acknowledged after it returns, not when it is received.
 - Redis has no real acknowledgements. Kombu keeps every delivered message in the `unacked` hash
   and puts it back on the queue once it is older than the **visibility timeout of 120 s**.
-  Kombu checks only every 100 s, so a task whose worker was killed comes back 120 to 230 s
-  after delivery (measured: 192 s). It is not redelivered when the worker restarts.
-- The visibility timeout must be longer than the longest task plus the longest retry
-  countdown (32 s), or a task that is still running is delivered a second time. The task is
-  idempotent, so a duplicate costs only CPU.
+  Kombu checks only every 100 s, so a task whose worker was killed comes back minutes after
+  delivery (measured: 192 s, and 260 s for an invoice, see TASK-21). It is not redelivered
+  when the worker restarts.
+- The visibility timeout must be longer than the longest task plus the longest retry countdown
+  (32 s), or a task that is still running is delivered a second time. A 500-line invoice renders
+  in about 1.2 s. The task is idempotent (see TASK-19), so a duplicate costs only CPU.
 - `worker_prefetch_multiplier=1`: each process holds only the task it is running. A killed
   worker strands at most `CELERY_CONCURRENCY` tasks, and replicas added with `--scale` find the
   backlog still in Redis instead of buffered in the first worker.
 - A prefork child that dies mid-task (for example OOM-killed) while its worker survives fails the
-  task with `WorkerLostError`, which goes to the dead-letter queue. It is not requeued, because an
-  image that kills one child would kill every child it was redelivered to.
+  task with `WorkerLostError`. It is not requeued, because a task that kills one child would kill
+  every child it was redelivered to. Whether billing then marks the invoice `failed` has not been
+  measured.
 
-### Retries and the dead-letter queue
-
-Only `sqlalchemy.exc.OperationalError` (database unreachable) is retried: up to 5 times,
-exponential backoff from 2 s capped at 2, 4, 8, 16, 32 s, with full jitter (each wait is random
-between 0 and the cap). Any other error is permanent, for example an upload that claims
-`image/jpeg` but is not an image.
-
-A task that fails for good, after retries or straight away, is published again unchanged to the
-`dead_letter` queue. No worker consumes it. `LLEN dead_letter` on `redis-broker` counts the dead
-tasks, and `LMOVE dead_letter cpu RIGHT LEFT` replays one.
-
-### Files
-
-On the `images` volume, shared by `catalog` and `catalog-worker`:
-
-| Path | Content |
-|---|---|
-| `/images/{product_id}/original` | the upload as received |
-| `/images/{product_id}/{thumbnail,small,medium,large}.jpg` | longest side 150, 300, 600, 1200 px |
-| `/images/{product_id}/original.webp` | the full-size image as WebP |
-
-Each upload replaces `original`, and each run overwrites the five outputs and replaces
-`products.image_paths` with their paths.
+Retries and permanent failures of `generate_invoice_pdf`: see TASK-21.
 
 ### Flower
 
-`make obs` starts Flower on `127.0.0.1:${FLOWER_PORT}`; `make up` does not. Flower needs task
-events and switches them on in every worker it finds (`Events of group {task} enabled by remote`
-in the worker log). Each task then publishes received, started and succeeded or failed events to
-`redis-broker`, broker traffic that a measured run should not include. Events stay on after
-Flower stops, until the worker restarts, so before a measured run stop Flower and restart
-`catalog-worker`.
+Flower starts with the monitoring (`OBS=true`, see Compose files and OBS) on
+`127.0.0.1:${FLOWER_PORT}`, watching db 0 of `redis-broker`. Flower needs task events and switches
+them on in every worker it finds (`Events of group {task} enabled by remote` in the worker log).
+Each task then publishes received, started and succeeded or failed events to `redis-broker`,
+broker traffic that a measured run should not include. Events stay on after Flower stops, until
+the worker restarts, so before a measured run with Flower stopped, restart `billing-worker`.
 
 Tasks still waiting in the queue are not in Flower's task list, because that needs `task-sent`
-events from `catalog`, which are off. The broker page shows the queue length instead. The REST
+events from `billing`, which are off. The broker page shows the queue length instead. The REST
 API under `/api` answers 401 because no authentication is configured; the web UI does not use
 it. The port is bound to localhost because Flower can shut down workers.
 
@@ -150,21 +132,19 @@ Prefork runs every task, and so every task signal, in a pool child, never in the
 child tries to bind port 9000 at `worker_process_init`; the first one serves `/metrics` from its own
 registry and polls the queue depth, the others skip. **With `CELERY_CONCURRENCY=1` the metrics
 cover every task of the container; above 1 they cover only that one child's tasks** (measured with
-2: four uploads, two counted). Scaling therefore goes through replicas, each scraped on its own.
+2: two of four tasks counted). Scaling therefore goes through replicas, each scraped on its own.
 A task whose child is killed fails in the parent (`WorkerLostError`), so that failure is not
 counted either.
 
-The port is reachable on the `shop` network only (`catalog-worker:9000`), not from the host.
-`catalog` passes it through at `GET /worker/metrics`, so it can be read at
-`localhost:${CATALOG_PORT}/worker/metrics`. With several worker replicas, each request reaches
-one of them.
+The port is reachable on the `shop` network only (`billing-worker:9000`), not from the host.
+Prometheus scrapes every replica (see TASK-23).
 
 ### Buckets
 
 | Histogram | Range | Why |
 |---|---|---|
-| `celery_task_duration_seconds` | 10 ms to 30 s | image processing takes hundreds of ms to seconds, the 600 px test image about 20 ms |
-| `celery_task_queue_wait_seconds` | 5 ms to 300 s | near zero while idle, minutes under backlog; a task redelivered after its worker was killed waits 120 to 230 s |
+| `celery_task_duration_seconds` | 10 ms to 30 s | an invoice renders in 24 ms (1 line) to about 1.2 s (500 lines) |
+| `celery_task_queue_wait_seconds` | 5 ms to 300 s | near zero while idle, minutes under backlog; a task redelivered after its worker was killed waits 120 to 260 s |
 
 ### Queue wait caveats
 
@@ -176,14 +156,12 @@ one of them.
 
 ### Queue depth
 
-A thread in the serving child reads `LLEN` of every queue the worker consumes plus `dead_letter`
-from `redis-broker` every `QUEUE_DEPTH_INTERVAL_SECONDS` (default 5). Nothing serves the gauge
-while the worker container is stopped. To watch a backlog build, stop consumption instead:
-`celery -A catalog.tasks control cancel_consumer cpu`, then `add_consumer cpu`.
-
-Measured with the worker stopped, five uploads 5 s apart, then the worker started: the
-histogram's sum was 109.0 s against 109.1 s from the logs, with waits of 11.7 to 31.9 s each in
-the matching bucket.
+A thread in the serving child reads `LLEN` of every queue the worker consumes from `redis-broker`
+every `QUEUE_DEPTH_INTERVAL_SECONDS` (default 5). Nothing serves the gauge while the worker
+container is stopped, so the Celery dashboard reads the depth from redis-exporter instead (see
+TASK-25). To watch a backlog build in the worker's own gauge, stop consumption:
+`celery -A billing.tasks control cancel_consumer cpu`, then `add_consumer cpu` (measured in
+TASK-21).
 
 ## Orders (TASK-11)
 
@@ -763,7 +741,7 @@ a second event for an order already invoiced, under a different `event_id`, comm
 
 Only after the commit does `handle()` queue `generate_invoice_pdf` with `order_id`, `customer_id`,
 `amount` and `lines` from the payload, and the event's correlation ID in the `x-correlation-id` task
-header, as catalog does for images. Queued inside the transaction, a worker could start before the
+header. Queued inside the transaction, a worker could start before the
 row is visible, or a rollback could leave a task for an invoice that does not exist. The publish
 runs in a thread (`asyncio.to_thread`), because kombu's Redis publish blocks, and while Redis is down
 it retries for about a second, stalling the other partitions and the HTTP endpoints.
@@ -777,10 +755,9 @@ on every task and the worker can report queue wait.
 
 ### Broker database
 
-Billing publishes to `redis://redis-broker:6379/1`, queue `cpu`. catalog-worker consumes `cpu` on
-db 0 and would take billing's tasks there, find no such task registered, and drop them. Separate db
-numbers keep the queue name from the task table and need no second instance. Flower, `make obs`,
-watches db 0 only.
+Billing publishes to `redis://redis-broker:6379/0`, queue `cpu`, the only queue on the broker.
+Flower watches the same db. Until the image worker was removed, billing used db 1, because
+catalog-worker consumed `cpu` on db 0 and would have dropped billing's tasks as unknown.
 
 ### Lost task after the commit
 
@@ -811,7 +788,7 @@ and `order_id`.
 Local Docker, one billing replica, from `docker compose down -v` and `make up`:
 
 - An order of 3 lines reached `paid`, its invoice was `pending` with number `INV-20261014-000001`,
-  and one message was in `cpu` on db 1, none on db 0. The message carried task
+  and one message was in `cpu`. The message carried task
   `billing.tasks.generate_invoice_pdf`, the order data with the lines, the request's correlation ID
   in `x-correlation-id`, and `published_at`. `generate_invoice` run by hand on it set `generated`
   and kept the number and `created_at`.
@@ -840,10 +817,10 @@ and 128 ms (50 lines). Task duration in the worker's metrics: see TASK-21.
 
 ### Worker
 
-`billing-worker` is the billing image running `celery -A billing.tasks worker`, like
-`catalog-worker`: prefork, `CELERY_CONCURRENCY` processes, queue `cpu` on redis-broker db 1, no
+`billing-worker` is the billing image running `celery -A billing.tasks worker`: prefork,
+`CELERY_CONCURRENCY` processes, queue `cpu` on redis-broker db 0, no
 result backend, the `invoices` volume, 2 CPUs and 1 GB. More replicas:
-`docker compose up --scale billing-worker=N`. The Celery settings are catalog's:
+`docker compose up --scale billing-worker=N`. The Celery settings (see TASK-9):
 `task_acks_late`, `worker_prefetch_multiplier=1` (so added replicas find the backlog still in Redis)
 and a visibility timeout of 120 s. The longest retry countdown is 32 s and a 500-line invoice
 renders in about 1.2 s, so a running task is never delivered twice.
@@ -865,12 +842,12 @@ Invoice status is `pending` (row written by the consumer), `completed` or `faile
 ### Retries and failure
 
 `sqlalchemy.exc.OperationalError` (database unreachable) and `OSError` (volume full, unwritable
-path) are retried, up to 5 times, backoff from 2 s capped at 2, 4, 8, 16, 32 s with full jitter, as
-for images. Celery keeps the task headers on a retry, so every retry logs the same correlation ID.
+path) are retried, up to 5 times, backoff from 2 s capped at 2, 4, 8, 16, 32 s with full jitter.
+Celery keeps the task headers on a retry, so every retry logs the same correlation ID.
 
 Any task that fails for good, after its retries or at once for any other error, sets the row to
-`failed` with `repr()` of the exception in `error`, from a `task_failure` handler. This replaces the
-dead-letter queue catalog has: `SELECT * FROM invoices WHERE status = 'failed'` lists every invoice
+`failed` with `repr()` of the exception in `error`, from a `task_failure` handler. This takes the place of
+a dead-letter queue: `SELECT * FROM invoices WHERE status = 'failed'` lists every invoice
 that never completed. `generate_invoice` rolls back with the failure, so nothing else is left
 behind. Running the task again for a failed invoice overwrites both fields. If the database itself
 is the cause, the `failed` update fails too and the row stays `pending`.
@@ -879,10 +856,8 @@ is the cause, the `failed` update fails too and the row stays `pending`.
 
 `billing/tasks.py` imports `shared.celery_metrics` and nothing in `shared/` changed. The worker
 serves `celery_task_queue_wait_seconds`, `celery_task_duration_seconds`, `celery_tasks_total` and
-`celery_queue_depth` on `billing-worker:9000/metrics`, reachable on the `shop` network only. Billing
-has no endpoint passing it through like catalog's `GET /worker/metrics`. The TASK-10 caveat applies
-as it is: above `CELERY_CONCURRENCY=1` one child's tasks are counted. The depth gauge also reports
-`dead_letter`, always 0 here, because the shared code polls it for every worker.
+`celery_queue_depth` on `billing-worker:9000/metrics`, reachable on the `shop` network only. The
+TASK-10 caveat applies as it is: above `CELERY_CONCURRENCY=1` one child's tasks are counted.
 
 WeasyPrint logs seven info lines per render (`Step 1 - Fetching and parsing HTML` …), each carrying
 the correlation ID, so the worker writes about nine log lines per task.
@@ -903,7 +878,7 @@ Local Docker, from `docker compose down -v` and `make up`, `CELERY_CONCURRENCY=1
   `docker compose start billing-worker`, worker startup included.
 - Worker SIGKILLed while rendering a 400-line invoice: the task stayed in `unacked`, the invoice
   `pending`. It was restored to the queue and completed 260 s after the kill, once, under its
-  correlation ID: longer than the 120 to 230 s measured for images.
+  correlation ID: longer than the 192 s measured for a task in TASK-9.
 - A backlog of 1500 three-line invoices queued with consumption cancelled, then released, two runs
   each:
 
@@ -954,7 +929,7 @@ series have to be exported before then.
 |---|---|---|---|
 | `catalog`, `orders`, `billing` | static | 8000 | `catalog:8000` |
 | `inventory`, `payments` | DNS, type A | 8000 | `<container IP>:8000` |
-| `catalog-worker`, `billing-worker` | DNS, type A | 9000 | `<container IP>:9000` |
+| `billing-worker` | DNS, type A | 9000 | `<container IP>:9000` |
 
 Compose DNS returns one address per container of a scaled service, and DNS discovery turns each
 into its own target, refreshed every 5 s. A static `inventory:8000` would reach one random replica
@@ -963,8 +938,7 @@ is still listed and reports `up` 0. A stopped replica, by contrast, drops out of
 disappears instead of going down. The IP changes when a container is recreated, so the instance
 label is stable only for the container's lifetime.
 
-`catalog`'s `GET /worker/metrics` is not scraped, since it would count the worker twice. The
-earlier caveats still hold: with `UVICORN_WORKERS` above 1 a scrape reaches one process, and with
+The earlier caveats still hold: with `UVICORN_WORKERS` above 1 a scrape reaches one process, and with
 `CELERY_CONCURRENCY` above 1 one pool child.
 
 ### Recording rules
@@ -989,8 +963,9 @@ the series.
 
 Local Docker, `make down` then `make obs`:
 
-- 7 targets, all `up`. `--scale inventory=3` made 9, each inventory replica with its own
-  instance, all `up` within 12 s. The two runs below used the 3 replicas.
+- 7 targets, all `up` (6 since the image worker was removed). `--scale inventory=3` made 9, each
+  inventory replica with its own instance, all `up` within 12 s. The two runs below used the 3
+  replicas.
 - 60 s of 17 orders/s and 42 product reads/s from the client: the rules recorded 16.7 and 41.1
   requests/s, p50 2.6 ms and p99 9.4 ms for `POST /orders`, a billing-worker queue wait p95 of
   8 ms. Reservations ran at 6.0, 5.5 and 5.7/s on the three replicas, payments at 15.5/s (the
@@ -1115,6 +1090,7 @@ cAdvisor used 0.34 CPU in its first minute. Prometheus now holds about 7,000 ser
 Local Docker, `make down` then `make obs`, one replica each:
 
 - 12 targets `up`: the 7 application targets, `cadvisor`, `postgres`, `kafka`, and `redis` twice.
+  11 since the image worker was removed (checked after `make down` and `make up`).
 - 150 s of 17 orders/s and 42 product reads/s, inventory stopped at 30 s and started at 77 s.
   Lag of group `inventory` on `order.created`, every 10 s:
 
@@ -1190,13 +1166,13 @@ consumer commits after each event.
 The Celery dashboard reads queue depth from `redis_key_size`, not from the workers'
 `celery_queue_depth`. That gauge is served by the worker, so it stops while the worker is down,
 which is exactly when the backlog builds. redis-exporter now runs with
-`--check-single-keys=db0=cpu,db0=dead_letter,db1=cpu`: `LLEN` of catalog's `cpu` and
-`dead_letter` on db 0 and of billing's `cpu` on db 1, on every scrape, and 0 for an empty queue.
+`--check-single-keys=db0=cpu`: `LLEN` of billing's queue `cpu` on db 0, on every scrape, and 0
+for an empty queue.
 It checks the same keys on redis-cache too, where they never exist, so the panel filters on
 `instance="redis-broker"`. If a queue name or db changes, this flag has to change with it.
 
-Task counts, durations and waits still come from the workers, with the TASK-10 caveat: with
-`CELERY_CONCURRENCY=5`, 2 of 10 image tasks were counted. A worker's first task series is created by
+Task counts, durations and waits still come from the worker, with the TASK-10 caveat: with
+`CELERY_CONCURRENCY=5` one pool child's tasks are counted. A worker's first task series is created by
 that task, so `rate()` does not see it, as for the HTTP series (see TASK-23).
 
 ### Measured
@@ -1205,9 +1181,9 @@ Local Docker, `make down` then `make obs`, `CELERY_CONCURRENCY=5`:
 
 - The datasource and the four dashboards were there with no manual step, and the datasource
   health check passed. Every panel query, run through Grafana's `/api/ds/query`, returned data
-  without errors. The exceptions were catalog-worker's waits and durations, for the reason above.
+  without errors.
 - 160 s of 17 orders/s and 42 product reads/s, inventory stopped from 30 to 75 s, billing-worker
-  from 80 to 120 s, 10 image uploads at 95 s. Lag of `inventory` on `order.created` peaked at 865,
+  from 80 to 120 s. Lag of `inventory` on `order.created` peaked at 865,
   billing's queue at 1,780, its queue wait p95 at 87 s.
 - billing-worker was at 100 % of its 2 CPUs from 30 s on: billing's queue had already grown to 202
   before the worker was stopped. At this load and concurrency, invoice rendering is the
@@ -1294,9 +1270,8 @@ Correlation ID text box and one logs panel, oldest line first, over the last hou
 The `!= ""` makes an empty box match nothing instead of every line without an ID. The dashboard does
 not refresh on its own, because a trace does not change once the order has finished.
 
-The correlation ID is the `x-correlation-id` response header of `POST /orders`. catalog and
-catalog-worker are not on an order's path, since orders reads prices from `products` directly. An
-image upload traces through them instead.
+The correlation ID is the `x-correlation-id` response header of `POST /orders`. catalog is not
+on an order's path, since orders reads prices from `products` directly.
 
 ### Measured
 
@@ -1307,8 +1282,6 @@ Local Docker, `make down` then `make obs`:
   `request` 0 ms, inventory `stock reserved` 105 ms, payments `payment recorded` 210 ms, orders
   `order status changed` 303 ms, billing `invoice requested` 313 ms, billing-worker 9 lines to
   `succeeded` at 453 ms. Every line after the first carried `order_id` 1.
-- An image upload: catalog `request`, then catalog-worker `product image processed` and
-  `succeeded`, 82 ms apart.
 - `--scale inventory=3` under 60 s of load: 326, 360 and 337 lines from `pracadyplomowa-inventory-1`,
   `-2` and `-3`.
 - Loki at 1.4 % of a CPU and 87 MB, Alloy at 2.6 % and 68 MB, during that load.
@@ -1319,7 +1292,7 @@ The stack is split in two files:
 
 | File | Content |
 |---|---|
-| `infra/docker-compose.yml` | Postgres, Kafka, both Redis, the migrations, the five services and both workers, the `shop` network and the application volumes |
+| `infra/docker-compose.yml` | Postgres, Kafka, both Redis, the migrations, the five services and billing-worker, the `shop` network and the application volumes |
 | `infra/docker-compose.obs.yml` | Flower, Prometheus, Grafana, Loki, Alloy, cAdvisor and the three exporters, with `prometheus_data`, `loki_data` and `alloy_data` |
 
 The monitoring file uses the network and services of the first, so it is only ever used together
@@ -1344,3 +1317,27 @@ Flower now starts with every `make up` while `OBS=true`, and it switches task ev
 worker (see TASK-9). A measured run with monitoring therefore includes that broker traffic, and a
 run with `OBS=false` does not. With `OBS=false` the `exporter` Postgres role still exists, because
 Postgres creates it on an empty volume whichever files are used.
+
+## Image pipeline removed
+
+Product images are gone: `POST /catalog/products/{id}/image`, the `process_product_image` task,
+`catalog-worker`, the `images` volume, catalog's `GET /worker/metrics`, the `dead_letter` queue,
+`bench/parallel_images.py` and `make test-images`. billing's `generate_invoice_pdf` is the only
+Celery task, and a task that fails for good marks its invoice `failed` instead of going to a
+dead-letter queue (see TASK-21).
+
+- Migration `a4c7e2b9f1d3_products_drop_image_paths` drops `products.image_paths`; its downgrade
+  adds the column back empty.
+- billing moved from db 1 to db 0 of `redis-broker`, where Flower already looks.
+- catalog no longer connects to `redis-broker`.
+- `pillow` and `python-multipart` are out of `pyproject.toml`. Pillow is still installed, as a
+  dependency of WeasyPrint.
+- Prometheus has no `catalog-worker` job, and redis-exporter checks `db0=cpu` only.
+
+A volume called `images` left by an earlier stack is no longer in the Compose file, so
+`make down` does not remove it: `docker volume rm pracadyplomowa_images`.
+
+Measured after `make down` and `make up`: alembic head `a4c7e2b9f1d3` with no `image_paths`
+column, the image route and `/worker/metrics` answering 404, 50 three-line orders all reaching a
+`completed` invoice, 11 Prometheus targets `up`, and with billing-worker stopped 10 tasks waiting
+in `cpu` on db 0, read as 10 by redis-exporter.

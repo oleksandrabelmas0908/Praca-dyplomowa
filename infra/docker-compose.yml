@@ -294,6 +294,32 @@ services:
       start_period: 30s
       start_interval: 1s
 
+  # Datasource and dashboards come from infra/grafana only. No volume: nothing Grafana stores
+  # itself is worth keeping
+  grafana:
+    image: grafana/grafana@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f  # 13.2.4
+    profiles:
+      - obs
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards:ro
+    networks:
+      - shop
+    cpus: 1.0
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 5m
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e  # v0.20.1
     profiles:
@@ -320,6 +346,9 @@ services:
   # Holds no address of its own: Prometheus passes redis-cache or redis-broker as ?target=
   redis-exporter:
     image: oliver006/redis_exporter@sha256:2f5c00216f2142f23e6d13de341325101c31f93b8f6c3e72fe33087136bf43ec  # v1.94.0-alpine
+    # LLEN of the Celery queues, catalog's on db 0 and billing's on db 1, readable while a
+    # worker is down (the worker's own celery_queue_depth is not)
+    command: ["--check-single-keys=db0=cpu,db0=dead_letter,db1=cpu"]
     profiles:
       - obs
     networks:

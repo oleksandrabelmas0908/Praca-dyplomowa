@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: dashboards
+    type: file
+    disableDeletion: true
+    # The JSON in infra/grafana/dashboards is the only copy: saving from the UI is refused
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

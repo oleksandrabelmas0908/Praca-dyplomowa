@@ -1129,3 +1129,88 @@ Local Docker, `make down` then `make obs`, one replica each:
   47 Postgres connections and 270 commits/s.
 - A row held with `FOR UPDATE` in one session and updated from a second:
   `pg_backends_waiting_for_lock` read 1. It read 0 throughout the load run.
+
+## Grafana (TASK-25)
+
+### Container
+
+`grafana`, 13.2.4, behind the `obs` profile, on `127.0.0.1:${GRAFANA_PORT}` only (on the server
+`ssh -L 3000:localhost:3000`). It logs in as `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`, and
+has 1 CPU and 512 MB. It has no volume: the datasource and dashboards come from `infra/grafana`,
+and nothing else Grafana stores is kept, so every `make down` gives back exactly the committed
+state.
+
+| File | Content |
+|---|---|
+| `provisioning/datasources/prometheus.yml` | Prometheus, uid `prometheus`, `timeInterval` 5 s (the scrape interval) |
+| `provisioning/dashboards/dashboards.yml` | loads every JSON in `infra/grafana/dashboards`, `allowUiUpdates: false` |
+| `dashboards/red.json`, `kafka.json`, `celery.json`, `resources.json` | the four dashboards |
+
+Saving a dashboard from the UI fails with `Cannot save provisioned dashboard`. A change to a JSON
+file shows up within about 10 s without a restart. Every panel uses fixed 30 s windows like the
+recording rules, so one graph means the same thing at every zoom level.
+
+### Time range and refresh
+
+Every dashboard opens on the last 15 minutes and refreshes every 10 s. 15 minutes holds the warm-up
+and one measured run; a whole campaign is a wider range picked by hand. 10 s is two scrapes, so each
+refresh has new data, at half the query load of refreshing at the scrape interval. Grafana only
+queries while a dashboard is open in a browser, so close it during a measured run.
+
+### Dashboards
+
+| Dashboard | Panels |
+|---|---|
+| RED per service | requests/s, 5xx/s, p50, p95, p99 by endpoint, from the TASK-23 rules (5xx from `http_requests_total`, 0 where there are none); event handlers: events/s, errors/s, latency p50/p95/p99 |
+| Kafka | lag by group and topic, lag by partition, produced/s by topic, consumed/s by group and topic, group members, partitions by topic |
+| Celery queues | depth per queue, queue wait p50/p95/p99, task duration p50/p95/p99, outcomes/s |
+| Resources | CPU and memory per container as a share of their limits and absolute; Postgres connections by state against `max_connections`, commits and rollbacks/s; Redis memory against `maxmemory`, evictions/s and in the time range |
+
+The RED dashboard and the Resources dashboard have a multi-select variable, Service and Container,
+defaulting to All. `/health` and `/ready` are left out of the HTTP panels.
+
+inventory and payments serve no HTTP besides health checks; their work is events. So the RED
+dashboard has a row for the handlers, from the existing metrics:
+
+| | inventory | payments | billing | orders |
+|---|---|---|---|---|
+| rate | `reservation_handler_duration_seconds_count` | `payment_handler_duration_seconds_count` | `invoice_handler_duration_seconds_count` | `order_status_transitions_total` |
+| errors | `reservations_total{outcome="error"}` | not counted | not counted | not counted |
+| latency | the same histograms | | | no histogram |
+
+The handler rates count every attempt, including duplicates and failures; the orders rate counts
+the status changes applied. payments and billing log a failed handler without a metric, so the
+errors panel covers inventory only.
+
+Consumed messages/s is the rate of the committed offset, which matches consumption because every
+consumer commits after each event.
+
+### Queue depth from the broker
+
+The Celery dashboard reads queue depth from `redis_key_size`, not from the workers'
+`celery_queue_depth`. That gauge is served by the worker, so it stops while the worker is down,
+which is exactly when the backlog builds. redis-exporter now runs with
+`--check-single-keys=db0=cpu,db0=dead_letter,db1=cpu`: `LLEN` of catalog's `cpu` and
+`dead_letter` on db 0 and of billing's `cpu` on db 1, on every scrape, and 0 for an empty queue.
+It checks the same keys on redis-cache too, where they never exist, so the panel filters on
+`instance="redis-broker"`. If a queue name or db changes, this flag has to change with it.
+
+Task counts, durations and waits still come from the workers, with the TASK-10 caveat: with
+`CELERY_CONCURRENCY=5`, 2 of 10 image tasks were counted. A worker's first task series is created by
+that task, so `rate()` does not see it, as for the HTTP series (see TASK-23).
+
+### Measured
+
+Local Docker, `make down` then `make obs`, `CELERY_CONCURRENCY=5`:
+
+- The datasource and the four dashboards were there with no manual step, and the datasource
+  health check passed. Every panel query, run through Grafana's `/api/ds/query`, returned data
+  without errors. The exceptions were catalog-worker's waits and durations, for the reason above.
+- 160 s of 17 orders/s and 42 product reads/s, inventory stopped from 30 to 75 s, billing-worker
+  from 80 to 120 s, 10 image uploads at 95 s. Lag of `inventory` on `order.created` peaked at 865,
+  billing's queue at 1,780, its queue wait p95 at 87 s.
+- billing-worker was at 100 % of its 2 CPUs from 30 s on: billing's queue had already grown to 202
+  before the worker was stopped. At this load and concurrency, invoice rendering is the
+  bottleneck, and the Resources dashboard shows it at its CPU limit.
+- After `make down` and `make obs` the four dashboards returned by the API were identical to
+  those before, apart from `id` and `version`.

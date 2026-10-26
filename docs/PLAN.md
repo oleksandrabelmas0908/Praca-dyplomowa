@@ -1735,3 +1735,325 @@ Local Docker:
 - payments paused at the first `POST /orders`: failed in 64 s with `order 1 still pending after
   30 s`, and the teardown removed the paused container.
 - After every one of these, no container was left and `.env` was identical to before the run.
+
+## Methodology (TASK-36)
+
+What each variant changes, what stays fixed while it varies, and what the comparison cannot show.
+The sections above hold the measurements and the detailed reasoning; this one gathers what a
+result depends on, so a chart can be explained without reading the code. A configuration is the
+nine flags of one entry in `bench/matrix.yaml` plus every other value in `.env.example`; both are
+listed here.
+
+### Experiments
+
+| Experiment | Question | Entries | Varies |
+|---|---|---|---|
+| E1 | Does async I/O serve the same database-bound handlers better than threads, and how does each scale with processes? | `e1-{async,sync}-w{1,2,4}` | `DB_DRIVER`, `UVICORN_WORKERS` |
+| E2 | How much does a cache in front of catalog reads change latency, throughput and database load, and how does the TTL change the hit ratio? | `e1-async-w1` (off), `e2-ttl-10`, `e2-ttl-60` | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` |
+| E3 | Event-driven choreography against a synchronous HTTP chain doing the same work: latency to the final status, throughput, behaviour under failure | `e2-ttl-60` (kafka), `e3-http` | `TRANSPORT` |
+| E4 | How do partitions and consumer replicas change event throughput and consumer lag? | `e4-p1-r1`, `e4-p3-r3`, `e4-p6-r3` | `KAFKA_PARTITIONS`, `INVENTORY_REPLICAS`, `PAYMENTS_REPLICAS` |
+| E5 | How does Celery's pool size change invoice throughput and the time tasks wait in the queue? | `e5-c1`, `e5-c4` | `CELERY_CONCURRENCY` |
+
+Baseline for every flag an entry does not vary: `DB_DRIVER=async`, `UVICORN_WORKERS=1`,
+`CACHE_ENABLED=true`, `CACHE_TTL_SECONDS=60`, `TRANSPORT=kafka`, `KAFKA_PARTITIONS=3`, one replica
+of inventory and payments, `CELERY_CONCURRENCY=2`. E1 is the exception: all six E1 entries run with
+the cache off, so every catalog read reaches the database.
+
+### DB_DRIVER (E1)
+
+**Changes.** At startup, catalog and orders mount one of two routers. `async`: `async def`
+handlers on the event loop, SQLAlchemy `AsyncSession` over asyncpg (`catalog/routes/async_routes.py`
+with `catalog/db/async_db.py`, the same pair in orders). `sync`: plain `def` handlers, which FastAPI
+runs in AnyIO's threadpool, `Session` over psycopg2 (`sync_routes.py` with `sync_db.py`). The two
+copies run the same statements in the same transactions; a change to one must be made to both. The
+duplication is intentional: it is the object E1 measures, not technical debt to remove.
+
+**Does not change.** Only catalog and orders receive the flag; inventory, payments and billing are
+async in every entry. Under `sync` both services still create the async engine as well: orders runs
+its outbox poller, cleanup, gauge and Kafka consumers on it, catalog only `/ready`. So only the HTTP
+request path differs. Both drivers use the same cache code, an async Redis client (TASK-8), but E1
+runs with the cache off.
+
+**Threadpool.** 40 threads per Uvicorn worker process, AnyIO's default (`THREADPOOL_SIZE=40`, TASK-7).
+Left at the default so that E1 compares the two drivers as a developer gets them, not two tuned
+setups. With a pool of 4 connections, at most 4 of the 40 threads hold a connection at once; the
+others wait for one at checkout (SQLAlchemy's 30 s pool timeout), so a larger threadpool would add
+waiting threads, not database concurrency. `THREADPOOL_SIZE` is applied in catalog only; orders'
+sync handlers use AnyIO's default, which is also 40.
+
+**Held constant.** 4 connections per engine per worker process, no overflow, for both drivers.
+Cache off, `kafka`, one replica, the same seed. Both drivers are run at 1, 2 and 4 workers.
+
+**Limitations.**
+- Both drivers are bound by the same 4 connections per worker. E1 shows how each one waits for the
+  database, threads blocking or coroutines suspended, not how much the database can do.
+- orders has 1 CPU, catalog 4. With 4 workers catalog's processes can use 4 CPUs, orders' share one.
+- Under `kafka`, `POST /orders` measures the order write and its outbox row, not the saga.
+- `e1-sync-w4` can open more connections than Postgres allows (see Connection ceiling).
+
+### UVICORN_WORKERS (E1)
+
+**Changes.** `--workers N` for all five HTTP services (TASK-34). With N above 1, Uvicorn's parent
+process spawns N children sharing the listening socket, and the kernel hands each new connection to
+one of them. Every worker has its own event loop, threadpool and database pools, and runs its own
+copy of whatever background work the service has: outbox poller, Kafka consumers, catalog's Redis
+client. N workers are therefore N members of each consumer group and N pollers sharing the outbox
+through `SKIP LOCKED`.
+
+**Held constant.** The container's CPU limit (catalog 4, every other service 1) and the pool per
+worker (4), so the possible database connections grow with N.
+
+**Limitation: one registry per worker.** Each worker keeps its own Prometheus registry, and
+`/metrics` answers from whichever worker gets the scrape's connection. With N above 1 a scrape sees
+one worker's counters, successive scrapes can hit different workers, and Prometheus reads the jumps
+between them as counter resets: request rates, latency histograms, outbox and handler metrics from
+the services are unusable for N above 1. Not solved, because the results do not come from them:
+latency and throughput are measured by k6 at the client, which sees every worker, and Prometheus is
+used for container resources (cAdvisor), consumer lag (kafka-exporter) and Celery queue depth
+(redis-exporter), none of which go through a service's registry. prometheus_client's multiprocess
+mode would fix it by writing every observation to memory-mapped files in a shared directory, at a
+cost per observation that the experiments would then carry without measuring it.
+
+**Limitation.** Every service except catalog has 1 CPU, so 2 or 4 workers there add processes and
+connections but no CPU.
+
+### CACHE_ENABLED and CACHE_TTL_SECONDS (E2)
+
+**Changes.** catalog only. `false`: no Redis client is created, and the handlers run the database
+path unchanged. `true`: cache-aside on the two read endpoints (TASK-8):
+
+| Key | Holds | Invalidation |
+|---|---|---|
+| `product:{id}` | `GET /catalog/products/{id}` | deleted by `PATCH /catalog/products/{id}`, otherwise TTL |
+| `product_list:{sha256}` | `GET /catalog/products`, hashed over `category`, `min_price`, `max_price`, `limit`, `offset` | TTL only |
+
+The value is the response JSON exactly as served, so a hit skips the database and Pydantic. Every
+write sets the TTL to `CACHE_TTL_SECONDS`. List keys are never invalidated, because finding the
+lists that contain a product would mean tracking list membership; a list can show a product's old
+values for up to one TTL after a `PATCH`.
+
+**Memory bound.** `redis-cache` has `maxmemory 64mb`, `allkeys-lru`, no persistence, a separate
+instance from the Celery broker (which must never evict). 64 MB holds about 32,600 of the 100,000
+seeded products, roughly a third, and list entries (41 kB at `limit=20`, 197 kB at `limit=100`)
+compete for the same space. Bounded so that the cache behaves like one whose working set is larger
+than its memory: without the bound the whole catalogue would fit, every read would hit after
+warm-up, and E2 would measure Redis rather than caching. The bound also keeps the instance inside
+its 512 MB container.
+
+**Held constant.** Everything at baseline except the two flags. Stock is not in the cached payload,
+so orders never make a cached product stale and E2 is independent of the order flow (TASK-15).
+
+**Limitations.**
+- The hit ratio depends on which keys k6 requests, uniform or skewed, as much as on the TTL. The
+  load profile is part of the configuration and has to be reported with the result.
+- `make seed` and `make reset` do not clear `redis-cache`. A run started right after another starts
+  with a warm cache unless it is flushed:
+  `docker compose -f infra/docker-compose.yml --project-directory . exec redis-cache redis-cli FLUSHALL`.
+
+### TRANSPORT (E3)
+
+**Changes.** orders, inventory and payments, at startup (TASK-33).
+
+| | `kafka` | `http` |
+|---|---|---|
+| `POST /orders` | writes the order and its `order.created` outbox row, answers `pending` | writes the order without an outbox row, calls `POST /reservations` on inventory, then `POST /payments`, sets the final status and answers with it |
+| Background | outbox pollers in orders, inventory and payments; consumers of `order.created`, `inventory.reserved`, `inventory.rejected`, `payment.completed` | none |
+| Endpoints | the HTTP endpoints of inventory and payments answer 404 | the consumers do not run |
+
+**Shared domain code.** Both paths call the same functions, so they do the same database work:
+
+| Service | Code |
+|---|---|
+| inventory | `reserve_all` and `release` in `inventory/db.py` |
+| payments | `call_provider` (the simulated delay) and `record_payment` in `payments/payment.py` |
+| orders | `set_status` in `orders/events.py` |
+
+What only the Kafka path does: the `processed_events` insert in every consumer, the outbox rows, the
+handler metrics. What only the HTTP path does: three HTTP calls from orders, and the release.
+
+**Timeouts** (orders, `http` only). Connect 0.5 s for every call. Read 2 s for reserve and for pay,
+0.5 s for release. A payment takes about 13 ms, 10 of them the simulated delay, so 2 s is over 100
+times a normal payment: only a stalled payments service times out. The worst case for one
+`POST /orders` is 6 s, well under k6's 60 s default, so a stalled chain fails in the service and not
+in the load generator. orders keeps one `httpx.AsyncClient` per worker with 100 connections, all
+kept alive.
+
+**Compensation.** Under `http`, if the pay call fails or times out after stock was reserved, orders
+calls `POST /reservations/{order_id}/release` once and rejects the order; a failed release is
+logged and counted, and the stock stays reserved. Under `kafka` there is nothing to undo: a handler
+that fails leaves its offset uncommitted, the broker redelivers the event until it succeeds, and
+payments never fails for business reasons. The broker holds the work; the synchronous chain has to
+unwind its own.
+
+**Held constant.** The domain functions and their SQL, async driver, 1 worker, 1 replica, cache on,
+the same seed. `KAFKA_PARTITIONS=3` matters under `kafka` only.
+
+**Limitations.**
+- **Latency does not mean the same thing.** Under `kafka` `POST /orders` returns before any work
+  is done, so its latency cannot be compared with the `http` response. The comparable number is the
+  time from the request to the final status: under `kafka` by polling `GET /orders/{id}`, or from
+  `orders.updated_at` − `orders.created_at`.
+- **The Kafka path waits on three outbox polls.** `order.created`, `inventory.reserved` and
+  `payment.completed` each sit in an outbox until the next poll, every 100 ms, so about 50 ms each
+  on average (TASK-12 measured a p50 outbox lag of 56 ms). Roughly 150 ms of the end-to-end time
+  under `kafka` is this interval, a property of the transactional outbox and its poll interval
+  rather than of Kafka.
+- **Billing does work only under `kafka`.** Paid orders get a PDF invoice on billing-worker, which
+  uses the same host. Stop billing-worker in E3's Kafka runs, or report that it was running.
+- **Throughput cap under `kafka`.** Each partition handles one event at a time, so payments handles
+  at most about partitions / 13 ms, around 225/s at 3 partitions (measured 201/s, TASK-17). Above
+  that, lag grows without bound and latency measures the queue.
+- **Three inconsistencies a timeout can leave** under `http`: a reservation committed after its
+  call timed out stays reserved; a payment committed after its call timed out remains for a
+  rejected order; a release that timed out may have succeeded. Queries that find them are in
+  TASK-33.
+- `TRANSPORT=http` needs `DB_DRIVER=async`; orders refuses to start otherwise.
+
+### KAFKA_PARTITIONS, INVENTORY_REPLICAS, PAYMENTS_REPLICAS (E4)
+
+**Changes.** The partition count of all four topics, set when `make up` creates them. A topic's
+partition count cannot change in place, so `make reset-topics` deletes and recreates them (TASK-34).
+The replicas flags set the number of inventory and payments containers.
+
+**Partitions are the unit of consumer parallelism.** A consumer process starts one task per
+partition assigned to it. Within a partition, events are handled one at a time in offset order and
+the offset is committed after each; partitions run concurrently (TASK-17). So at most
+`KAFKA_PARTITIONS` events of a topic are handled at once per consumer group, however many replicas
+run, and the group's throughput is capped at about partitions / handler duration: for payments,
+about 75/s with 1 partition and 225/s with 3.
+
+**Replica ceiling.** A group's members are its replicas times `UVICORN_WORKERS` (orders has two
+consumers per worker). Kafka gives each partition to one member, so members beyond the partition
+count get none and stay idle. At `e4-p3-r3` each member has one partition; at `e4-p6-r3` each has
+two, handled concurrently. Replicas add processes and CPU (1 CPU each), not concurrency beyond the
+partition count.
+
+**Held constant.** `kafka`, async, 1 worker, cache on. One broker (2 CPUs, 512 MB heap), replication
+factor 1. Messages are keyed by order ID, so every event of one order goes to one partition, in order.
+
+**Limitations.**
+- One broker and replication factor 1: no replication cost and no broker failover.
+- Partitions apply to all four topics, `payment.completed` included, so billing's consumer changes
+  with them too.
+- Deleting topics resets the consumer groups' offsets; a reset run starts from empty topics.
+
+### CELERY_CONCURRENCY (E5)
+
+**Changes.** The number of prefork pool processes in the billing-worker container
+(`worker_concurrency`). One container, 2 CPUs, 1 GB.
+
+**Held constant.** One billing-worker replica, queue `cpu`, `worker_prefetch_multiplier=1`,
+`task_acks_late`, up to 5 retries with backoff factor 2 and jitter, broker visibility timeout 120 s
+(TASK-9, TASK-21). Billing gets tasks only under `kafka`.
+
+**Limitations.**
+- Above 1, the worker's own metrics (`celery_task_*`, queue wait included) come from one pool child
+  only (TASK-10): at concurrency 4 they cover about a quarter of the tasks. Queue depth is read from
+  redis-broker by redis-exporter and is complete.
+- `e5-c4` runs 4 processes on 2 CPUs. Rendering a PDF is CPU-bound, so above 2 the extra processes
+  share the CPUs.
+
+### Constants
+
+Fixed in every configuration; changing any of them changes the results.
+
+| Constant | Value | Where |
+|---|---|---|
+| Simulated payment delay | 10 ms, `asyncio.sleep`, before the transaction opens; a payment takes about 13 ms | `PROVIDER_DELAY_SECONDS`, `payments/payment.py` |
+| Database pool | 4 connections per engine per Uvicorn worker, no overflow, the same for both drivers | `DB_POOL_SIZE=4`, `DB_MAX_OVERFLOW=0` |
+| Threadpool | 40 threads per worker (sync handlers only) | `THREADPOOL_SIZE=40`, AnyIO default |
+| Celery | concurrency 2 outside E5, prefork, prefetch 1 | `CELERY_CONCURRENCY` |
+| Outbox | poll every 100 ms, up to 100 rows per pass | `OUTBOX_POLL_INTERVAL_SECONDS=0.1` |
+| Kafka consumers | one event at a time per partition, offset committed after each | `shared/kafka.py` |
+| HTTP chain | connect 0.5 s, reserve 2 s, pay 2 s, release 0.5 s, 100 kept-alive connections | `.env.example`, `orders/main.py` |
+| Seed | 100,000 products, stock uniform 1 to 10 from random seed 5, 10 % set to 0: 10,032 products at zero, 495,578 units | `catalog/seed.py`, `SEED_ZERO_STOCK_FRACTION=0.1` |
+| Cache | 64 MB, `allkeys-lru`; TTL 60 s outside E2 | `infra/docker-compose.yml` |
+| Prometheus | scrape and rule evaluation every 5 s, scrape timeout 3 s, retention 30 days; cAdvisor housekeeping 5 s | `infra/prometheus/prometheus.yml` |
+| Postgres | 18.6 with its default configuration, untuned: `max_connections` 100 | image default |
+| Python | 3.12.14, library versions pinned in `pyproject.toml` | `infra/Dockerfile` |
+
+Container limits (`cpus`, `mem_limit`):
+
+| Container | CPUs | Memory |
+|---|---|---|
+| postgres | 4.0 | 1 GB |
+| catalog | 4.0 | 4 GB |
+| kafka | 2.0 | 1 GB (heap 512 MB) |
+| billing-worker | 2.0 | 1 GB |
+| orders, inventory, payments, billing | 1.0 each | 512 MB each |
+| redis-cache, redis-broker | 1.0 each | 512 MB each |
+| prometheus, loki | 1.0 each | 1 GB each |
+| flower, cadvisor, grafana | 1.0 each | 512 MB each |
+| alloy, postgres-exporter, redis-exporter, kafka-exporter | 0.5 each | 256 MB each |
+
+Images are pinned by digest in the Compose files, with the version in a comment: Postgres 18.6,
+Kafka 4.3.1 (KRaft, single node), Redis 8.10.2, Prometheus v3.15.0, Grafana 13.2.4.
+
+### Connection ceiling
+
+Pools open connections on demand, so these are upper bounds. Each engine has 4; under `sync`,
+catalog and orders have two engines per worker. billing-worker opens one connection per running
+task (`NullPool`). Postgres allows 100.
+
+| Entry | catalog | orders | inventory | payments | billing | billing-worker | Total |
+|---|---|---|---|---|---|---|---|
+| any w1, 1 replica | 4 | 4 | 4 | 4 | 4 | 2 | 22 |
+| `e1-sync-w1` | 8 | 8 | 4 | 4 | 4 | 2 | 30 |
+| `e1-async-w4` | 16 | 16 | 16 | 16 | 16 | 2 | 82 |
+| `e1-sync-w4` | 32 | 32 | 16 | 16 | 16 | 2 | **114** |
+| `e4-p*-r3` | 4 | 4 | 12 | 12 | 4 | 2 | 38 |
+| `e5-c4` | 4 | 4 | 4 | 4 | 4 | 4 | 24 |
+
+Only `e1-sync-w4` can exceed the limit. In practice catalog's async engine under `sync` opens at most
+one connection per worker (`/ready`), and inventory, payments and billing need at most one per
+partition being handled, so the real peak is lower; it has not been measured under load. The
+comment in `.env.example` gives 80 as the worst case, which leaves out the second engine under
+`sync` and billing-worker.
+
+### Known limitations
+
+- **Instrumentation overhead is not measured.** Metrics are always on; there is no switch to turn
+  them off. Every request goes through the middleware (route matching, four metric updates, one
+  log line), and handlers, the outbox, Kafka consumers and Celery tasks update histograms. The cost
+  is in every configuration, but not equally: the Kafka path has more instrumented steps than the
+  HTTP path. The only part measured is scraping, about 0.15 % of orders' CPU (TASK-23). The thesis
+  must not call the overhead negligible.
+- **One database shared by all five services**, not one per service. One Postgres container, one
+  Alembic chain, unique table names. Database-per-service would put four more Postgres instances on
+  the same host, competing for the CPU and memory the experiments measure, and none of the
+  experiments is about data isolation. The consequences: every service contends for the same
+  Postgres (4 CPUs, 1 GB, default configuration), so its CPU and row locks couple the services, and
+  load on one shows up in the others' latency. Some reads cross service boundaries in a way
+  database-per-service would not allow: orders reads `products.price` and `products.name` when it
+  writes an order (TASK-11), and inventory keeps stock in two columns of catalog's `products`
+  (TASK-15). Ownership is a convention, not enforced.
+- **Payments always succeed.** The only business rejection is out of stock, decided by inventory
+  before payment. The Kafka saga therefore has no compensating flow, and the only compensation in
+  the system, the release, runs under `http` and only after a transport failure. The results say
+  nothing about the cost of compensation in a choreographed saga.
+- **Status `reserved` is never set.** Orders consumes only `inventory.rejected` and
+  `payment.completed`, so an order goes from `pending` straight to `paid` (TASK-17).
+- **The envelope field is `correlation_id`**, where the project brief calls it `request_id`. Same
+  role: it travels from the HTTP request through every event and into the Celery task headers.
+- **One host.** All containers share the host's CPU and clock. Cross-process timings (outbox lag,
+  Celery queue wait) rely on that shared clock. The values measured in this file come from local
+  Docker on a laptop; the measurement server's specification is still open.
+- **Stock runs down during a run**, so the rejection rate rises with it. `make reset` before every
+  measured run restores it, along with fresh topics and an empty `reservations` table.
+- **Flower adds broker traffic.** With `OBS=true` Flower switches task events on in every worker,
+  and they stay on after Flower stops until the worker restarts (TASK-9). Restart billing-worker
+  before a measured run without Flower.
+- **The Kafka path does idempotency work the HTTP path does not**: one `processed_events` insert per
+  event in every consumer. The HTTP path has no redelivery and so no deduplication; this is part of
+  what E3 compares, not a difference to remove.
+
+### Reproducing a configuration
+
+1. `cp .env.example .env` and set the four passwords to any values. Every other value in
+   `.env.example` is the value the experiments use.
+2. Set the nine flags of the entry from `bench/matrix.yaml` in `.env`.
+3. `make smoke ENTRY=<name>` boots the entry from empty volumes, checks that every flag took effect
+   in the running containers, and runs one paid and one rejected order. It leaves the stack down.
+4. `make up` (with `OBS=true` for the monitoring), then `make reset`.
+5. Flush `redis-cache`, and restart billing-worker if Flower ran before.
+6. Warm up, then measure.

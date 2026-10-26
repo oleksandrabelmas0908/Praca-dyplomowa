@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -18,17 +19,28 @@ from shared.settings import settings
 setup_logging(settings.service_name, settings.log_level)
 logger = structlog.get_logger()
 
+if settings.transport == "http" and settings.db_driver == "sync":
+    raise RuntimeError("TRANSPORT=http needs DB_DRIVER=async, the HTTP chain has no sync copy")
+
+# httpx keeps only 20 idle connections by default, so under load most calls would open a new one
+HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=100)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Async under both DB_DRIVER values: the flag compares the HTTP request path, which is what the
-    # load generator drives, and these background loops are not part of that comparison
-    async with (
-        db_lifespan(app),
-        outbox.poller(app.state.session_factory, ["order.created"]),
-        events.consumers(app.state.session_factory),
-    ):
-        yield
+    async with db_lifespan(app):
+        if settings.transport == "http":
+            async with httpx.AsyncClient(limits=HTTP_LIMITS) as client:
+                app.state.http_client = client
+                yield
+            return
+        # Async under both DB_DRIVER values: the flag compares the HTTP request path, which is what
+        # the load generator drives, and these background loops are not part of that comparison
+        async with (
+            outbox.poller(app.state.session_factory, ["order.created"]),
+            events.consumers(app.state.session_factory),
+        ):
+            yield
 
 
 app = FastAPI(lifespan=lifespan)
@@ -37,6 +49,7 @@ app.add_middleware(CorrelationId)
 orders_router = sync_routes.router if settings.db_driver == "sync" else async_routes.router
 app.include_router(orders_router, tags=["orders"])
 logger.info("database driver", driver=settings.db_driver)
+logger.info("transport", transport=settings.transport)
 
 
 @app.get("/health")

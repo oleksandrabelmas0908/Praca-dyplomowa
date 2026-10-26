@@ -8,6 +8,7 @@ from orders.models import Order, OrderLine
 from orders.schemas import OrderLineCreate
 from shared.db import OutboxEvent
 from shared.events import Event
+from shared.settings import settings
 
 products = table(
     "products",
@@ -50,6 +51,9 @@ async def create_order(
     )
     session.add(order)
     await session.flush()
+    if settings.transport == "http":
+        await session.commit()
+        return order
     event = Event(
         event_type="order.created",
         occurred_at=order.created_at,

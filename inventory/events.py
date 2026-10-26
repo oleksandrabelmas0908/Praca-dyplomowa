@@ -5,7 +5,6 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from inventory.db import reserve_all
-from inventory.schema import RejectionReason
 from shared.db import OutboxEvent
 from shared.events import Event
 from shared.idempotency import idempotent
@@ -28,16 +27,13 @@ reservation_duplicates_total = Counter(
     "reservation_duplicates_total", "order.created events skipped as already processed"
 )
 
-logger = structlog.get_logger()
-
 
 @idempotent
 async def on_order_created(session: AsyncSession, event: Event) -> Counter:
     order_id = event.payload["order_id"]
     lines = [(line["product_id"], line["quantity"]) for line in event.payload["lines"]]
-    rejection = await reserve_all(session, lines)
+    rejection = await reserve_all(session, order_id, lines)
     if rejection is None:
-        logger.info("stock reserved", lines=len(lines))
         outcome = Event(
             event_type="inventory.reserved",
             correlation_id=event.correlation_id,
@@ -50,21 +46,10 @@ async def on_order_created(session: AsyncSession, event: Event) -> Counter:
         )
         counter = reservations_total.labels("reserved")
     else:
-        details = {
-            "reason": rejection.reason,
-            "product_id": rejection.product_id,
-            "requested": rejection.requested,
-            "available": rejection.available,
-            "missing": rejection.requested - rejection.available,
-        }
-        if rejection.reason is RejectionReason.product_not_found:
-            logger.error("order rejected, unknown product", **details)
-        else:
-            logger.info("order rejected", **details)
         outcome = Event(
             event_type="inventory.rejected",
             correlation_id=event.correlation_id,
-            payload={"order_id": order_id, **details},
+            payload={"order_id": order_id, **rejection.model_dump()},
         )
         counter = reservations_total.labels("rejected")
     session.add(

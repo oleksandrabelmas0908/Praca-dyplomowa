@@ -17,6 +17,7 @@ COPY migrations/ ./migrations/
 # migrations/env.py imports each service's models
 COPY billing/ ./billing/
 COPY catalog/ ./catalog/
+COPY inventory/ ./inventory/
 COPY orders/ ./orders/
 COPY payments/ ./payments/
 

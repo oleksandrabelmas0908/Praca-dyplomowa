@@ -357,7 +357,8 @@ every run.
 
 Nothing ever returns reserved stock (payments always succeeds, and a rejected order reserves
 nothing), so stock only falls during a run and the rejection rate rises with it. Reseed before each
-measured run.
+measured run. Since TASK-33, under `TRANSPORT=http` a failed payment call releases its order's
+stock again.
 
 ### Reservation
 
@@ -509,7 +510,7 @@ Local Docker, one replica unless stated:
 
 ### Simulated provider
 
-Payments always succeed. `PROVIDER_DELAY_SECONDS` in `payments/events.py` stands in for the round
+Payments always succeed. `PROVIDER_DELAY_SECONDS` in `payments/payment.py` (`payments/events.py` before TASK-33) stands in for the round
 trip to a payment provider: **10 ms**, waited with `asyncio.sleep`. It is a constant, not a setting,
 so every run uses the same value and every paid order's end-to-end latency includes it once.
 
@@ -1408,3 +1409,186 @@ then started again:
 - `ErrorRateHigh` takes longest to resolve, because the 2-minute rate window still holds the errors.
 - Afterwards every lag and outbox count was 0, all 11 targets were `up`, and every paid order had a
   completed invoice, apart from those that the `make test-invoices` runs delete on cleanup.
+
+## HTTP transport (TASK-33)
+
+### Selection
+
+`TRANSPORT` in `.env`, `kafka` by default, is read at startup by orders, inventory and payments,
+and each logs it once (`"event": "transport"`). Switching takes an `.env` change and `make up`, which
+recreates the three containers.
+
+| Service | `kafka` | `http` |
+|---|---|---|
+| orders | outbox poller, consumers of `inventory.rejected` and `payment.completed`. `POST /orders` writes the order and its `order.created` row and answers `pending` | no poller, no consumers. `POST /orders` writes the order without an outbox row, calls inventory, then payments, sets the final status and answers with it |
+| inventory | outbox poller, `order.created` consumer, no reservation endpoints (404) | `POST /reservations`, `POST /reservations/{order_id}/release`, no poller or consumer |
+| payments | outbox poller, `inventory.reserved` consumer, no `POST /payments` (404) | `POST /payments`, no poller or consumer |
+
+Only one path can run, so no order is processed twice. Under `http` nothing is published, so billing
+gets no `payment.completed` and renders no invoices: a Kafka run renders PDFs on the same host and an
+HTTP run does not, unless billing-worker is stopped for the Kafka run too. Kafka still starts under
+`http`, and the services still wait for it.
+
+orders refuses to start with `DB_DRIVER=sync` and `TRANSPORT=http`: the chain exists only in the
+async route, so the two experiments stay independent.
+
+### Shared domain code
+
+| Service | Shared code | Kafka path | HTTP path |
+|---|---|---|---|
+| inventory | `reserve_all(session, order_id, lines)` and `release(session, order_id)` in `inventory/db.py` | `on_order_created` | `POST /reservations`, `POST /reservations/{order_id}/release` |
+| payments | `call_provider()` (the 10 ms delay) and `record_payment()` in `payments/payment.py` | `handle` / `on_inventory_reserved` | `POST /payments` |
+| orders | `set_status(session, order_id, status)` in `orders/events.py` | status consumers | `orders/chain.py` |
+
+The event handlers keep only what is specific to Kafka: the `processed_events` insert, the outbox
+row and the handler metrics (`reservations_total`, `payments_total` and the handler durations,
+which therefore stay at 0 under `http`). The log lines `stock reserved`, `order rejected` and
+`payment recorded` now come from the shared code, so both transports write them. Under `http` the
+endpoints' outcomes are in `http_requests_total` by status (201, 409).
+
+### Reservations
+
+Release has to know what an order reserved, and has to tell a second release from a first, so
+inventory records each reservation in `reservations`:
+
+| Column | |
+|---|---|
+| `order_id` | primary key |
+| `lines` | JSONB, `[{"product_id", "quantity"}]` in product ID order |
+| `status` | `reserved` or `released` |
+| `created_at`, `released_at` | |
+
+`reserve_all` inserts the row first inside its savepoint, `ON CONFLICT DO NOTHING`. A conflict
+means the order was already reserved: nothing changes and it reports success, so a second
+`order.created` for the same order under a new `event_id`, which used to reserve twice, is now a
+no-op. A rejection rolls the savepoint back, so a rejected order has no row. This costs the Kafka
+path one `INSERT` per order as well.
+
+`release` is one conditional statement, then one `UPDATE` per line in the stored product ID order,
+the same lock order as `reserve_all`:
+
+```sql
+UPDATE reservations SET status = 'released', released_at = now()
+WHERE order_id = :order_id AND status = 'reserved'
+RETURNING lines
+```
+
+A second release, or a release for an order with no reservation, gets no row back and changes
+nothing. Two concurrent releases queue on the row lock, and the second finds `released`.
+
+`make seed` resets stock but leaves `reservations`, so after a reseed old rows no longer add up to
+`stock_reserved`. Nothing releases an order from before the seed, so this matters only to checks
+that compare the two: truncate `reservations` when reseeding for such a check.
+
+### Endpoints
+
+| Endpoint | Body | Response |
+|---|---|---|
+| inventory `POST /reservations` | `order_id`, `lines` of `product_id`, `quantity` | 201 `{order_id, status: "reserved"}`, also for an order already reserved. 409 with `reason`, `product_id`, `requested`, `available`, `missing`, as in `inventory.rejected` |
+| inventory `POST /reservations/{order_id}/release` | none | 200 `{order_id, released}`, `released` false when nothing was reserved |
+| payments `POST /payments` | `order_id`, `amount` | 201 `{order_id, status: "completed"}`, also for an order already paid |
+| orders `POST /orders` | unchanged | 201 with `status` `paid` or `rejected` |
+
+### Timeouts
+
+| Setting | Value | Call |
+|---|---|---|
+| `HTTP_CONNECT_TIMEOUT_SECONDS` | 0.5 | all three |
+| `INVENTORY_TIMEOUT_SECONDS` | 2 | reserve |
+| `PAYMENTS_TIMEOUT_SECONDS` | 2 | pay |
+| `RELEASE_TIMEOUT_SECONDS` | 0.5 | release |
+
+The per-call value is httpx's read, write and pool timeout. The pool timeout is the wait for a free
+connection once all 100 are busy.
+
+- **Pay 2 s.** The payment takes about 13 ms, 10 of them the simulated provider delay; the pay call
+  averaged 15 ms at 100 orders/s. 2 s is over 100 times that, so a normal payment does not time out
+  and only a stalled payments service does.
+- **Reserve 2 s.** 1 to 3 ms normally, seconds only when waiting on a row lock (TASK-15).
+- **Connect 0.5 s.** Under a millisecond inside the Docker network. A stopped container fails at once
+  (its name no longer resolves, `ConnectError`); the timeout covers a host that does not answer.
+- **Release 0.5 s.** The request has already failed, so release gets one short attempt and no retry.
+
+Worst case for one `POST /orders` is connect plus read for each call: 2.5 + 2.5 + 1 = 6 s, well under
+k6's 60 s default, so a stalled chain fails in the service rather than in the load generator.
+
+orders uses one `httpx.AsyncClient` per process with 100 connections, all kept alive (httpx keeps
+only 20 idle by default, so under load most calls would open a new connection). With more than one
+inventory or payments replica, Docker DNS spreads only new connections; a kept-alive connection
+stays on the replica it opened to, so the load is not evenly spread.
+
+### Failures and compensation
+
+| Case | Order | Release | Log | Counted as |
+|---|---|---|---|---|
+| inventory answers 409 | rejected | no | info `order rejected by inventory` with the shortfall | `order_status_transitions_total` only |
+| reserve call fails, times out or answers other than 201/409 | rejected | no | error `reserve call failed, order rejected` | `chain_failures_total{call="reserve", cause}` |
+| pay call fails, times out or answers other than 201 | rejected | once | error `pay call failed, releasing the reservation` | `chain_failures_total{call="pay", cause}`, `chain_releases_total` |
+| release call fails or times out | rejected | | error `release failed, stock may still be reserved` | `chain_release_failures_total{cause}` |
+
+`cause` is the httpx exception class (`ConnectError`, `ConnectTimeout`, `ReadTimeout`, `PoolTimeout`,
+`RemoteProtocolError`, ...) or `status_<code>`. Every line carries `order_id` and `correlation_id`.
+
+A timeout gives no answer, and on this path nothing redelivers, so three inconsistencies are
+possible. On the Kafka path the broker holds the uncommitted offset instead.
+
+1. **Reserve times out after inventory committed.** The order is rejected and its stock stays
+   reserved. The ticket releases only after a failed payment, so nothing gives it back.
+2. **Pay times out after payments committed.** The order is rejected and its stock released, but a
+   payment exists. There is no refund.
+3. **Release times out after inventory committed.** It is logged and counted as failed, but the
+   stock was released, so `chain_release_failures_total` is an upper bound.
+
+They are found afterwards with:
+
+```sql
+-- rejected orders whose stock is still reserved (1, and a release that really failed)
+SELECT o.id FROM orders o JOIN reservations r ON r.order_id = o.id
+WHERE o.status = 'rejected' AND r.status = 'reserved';
+-- rejected orders with a payment (2)
+SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.status = 'rejected';
+```
+
+### Metrics and logs
+
+| Metric (orders) | |
+|---|---|
+| `chain_call_duration_seconds{call}` | `reserve`, `pay`, `release`: from sending to the response or error, failed calls and the wait for a pool connection included, the same buckets as the HTTP histograms |
+| `chain_failures_total{call, cause}` | reserve and pay calls that failed |
+| `chain_releases_total` | releases triggered by a failed pay call |
+| `chain_release_failures_total{cause}` | release calls that failed |
+
+`order_status_transitions_total` counts the final status on both transports.
+
+orders sends the request's correlation ID as `X-Correlation-ID` on every call, and the middleware
+in inventory and payments binds it, so one ID still returns the whole chain from Loki. The `httpx`
+logger is set to warning, because it logs every request at info and the receiving service's request
+line already covers it.
+
+### Measured
+
+Local Docker, one replica of each service:
+
+- An order with stock under `http`: 201 `paid` in 63 ms. Inventory answered in 11 ms, payments in
+  21 ms, one correlation ID in the lines of all three services, and no outbox row was written.
+- The same 300 orders (fixed random seed, 1 to 3 lines over products 1 to 40, so most are rejected),
+  sent one at a time after a reseed, each waited for until it left `pending`: 71 `paid` and 229
+  `rejected` under both transports, identical order by order. Afterwards available plus reserved
+  was 495,578 under both, and `stock_reserved` matched the live reservations for every product.
+- payments stopped: `ConnectError` on pay, release, stock back, order `rejected`, answered in 0.09 s.
+- payments paused: `ReadTimeout` after 2 s, release, order `rejected` in 2.06 s. When unpaused,
+  payments recorded the payment: case 2, found by the second query.
+- payments paused, inventory paused during the pay call: the release timed out and was logged and
+  counted as failed, but inventory handled it from its socket buffer when unpaused and the stock came
+  back: case 3.
+- payments paused, inventory stopped during the pay call: release `ConnectError`, order `rejected`,
+  the unit left reserved and found by the first query, `chain_release_failures_total` 1.
+- inventory stopped: reserve `ConnectError`, order `rejected` in 0.04 s, no release.
+- Directly against inventory: the same reservation twice reserved once, a release returned the
+  units, a second release returned `released: false` with stock unchanged, and 30 of a product with 4
+  answered 409 with `missing` 26.
+- 100 orders/s for 20 s (2000 orders of 1 to 4 lines over 2000 products): all 201, 867 `paid`, 1133
+  `rejected`, no chain failures and no releases. Mean reserve call 6.3 ms, pay call 14.9 ms. Client
+  latency p50 8 ms, p95 26 ms, p99 314 ms. Stock totals unchanged.
+- After `docker pause` and `unpause`, Docker reported the container unhealthy and `make up` stopped
+  on it until the container was restarted. That comes from the test, not from the services.

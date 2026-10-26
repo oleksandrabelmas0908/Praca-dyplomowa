@@ -1,19 +1,14 @@
-import asyncio
 import time
 from decimal import Decimal
 
 import structlog
 from prometheus_client import Counter, Histogram
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from payments.models import Payment, PaymentStatus
+from payments.payment import call_provider, record_payment
 from shared.db import OutboxEvent
 from shared.events import Event
 from shared.idempotency import idempotent
-
-
-PROVIDER_DELAY_SECONDS = 0.01
 
 # The provider delay plus a few ms in the database, seconds when waiting on a lock
 DURATION_BUCKETS = (
@@ -31,25 +26,14 @@ payment_duplicates_total = Counter(
     "inventory.reserved events skipped as already processed or for an order already paid",
 )
 
-logger = structlog.get_logger()
-
 
 @idempotent
 async def on_inventory_reserved(session: AsyncSession, event: Event) -> Counter:
     order_id = event.payload["order_id"]
     amount = Decimal(event.payload["total_amount"])
-    payment = (
-        await session.execute(
-            insert(Payment)
-            .values(order_id=order_id, amount=amount, status=PaymentStatus.completed)
-            .on_conflict_do_nothing(index_elements=[Payment.order_id])
-            .returning(Payment.id, Payment.created_at)
-        )
-    ).one_or_none()
+    payment = await record_payment(session, order_id, amount)
     if payment is None:
-        logger.debug("order already paid")
         return payment_duplicates_total
-    logger.info("payment recorded", payment_id=payment.id)
     outcome = Event(
         event_type="payment.completed",
         occurred_at=payment.created_at,
@@ -75,7 +59,7 @@ async def handle(session_factory: async_sessionmaker[AsyncSession], event: Event
     structlog.contextvars.bind_contextvars(order_id=event.payload["order_id"])
     started = time.perf_counter()
     try:
-        await asyncio.sleep(PROVIDER_DELAY_SECONDS)
+        await call_provider()
         counter = await on_inventory_reserved(session_factory, event)
     finally:
         payment_handler_duration_seconds.observe(time.perf_counter() - started)

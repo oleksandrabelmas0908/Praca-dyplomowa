@@ -32,6 +32,14 @@ class Settings(BaseSettings):
 
     kafka_bootstrap_servers: str
 
+    transport: Literal["kafka", "http"] = "kafka"
+    inventory_url: str = ""
+    payments_url: str = ""
+    http_connect_timeout_seconds: float = 0.5
+    inventory_timeout_seconds: float = 2.0
+    payments_timeout_seconds: float = 2.0
+    release_timeout_seconds: float = 0.5
+
     outbox_poll_interval_seconds: float = 0.1
     outbox_retention_seconds: int = 86400
 

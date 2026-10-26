@@ -54,3 +54,5 @@ def setup_logging(service_name: str, log_level: str) -> None:
 
     # the request log line comes from the correlation ID middleware instead
     logging.getLogger("uvicorn.access").disabled = True
+    # one line per outbound call in orders' HTTP chain, the receiving service logs the request
+    logging.getLogger("httpx").setLevel(logging.WARNING)

@@ -1,11 +1,13 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from orders import chain
 from orders.db import async_db
 from orders.schemas import OrderCreate, OrderResponse
 from shared.db import get_session
+from shared.settings import settings
 
 router = APIRouter()
 
@@ -13,6 +15,7 @@ router = APIRouter()
 @router.post("/orders", status_code=201)
 async def create_order(
     order: OrderCreate,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> OrderResponse:
     product_ids = [line.product_id for line in order.lines]
@@ -23,6 +26,8 @@ async def create_order(
             status_code=422, detail=f"unknown product_id: {', '.join(map(str, unknown))}"
         )
     created = await async_db.create_order(session, order.customer_id, order.lines, products)
+    if settings.transport == "http":
+        created = await chain.run(request.app.state.http_client, session, created)
     return OrderResponse.model_validate(created)
 
 

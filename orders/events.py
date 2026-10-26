@@ -23,8 +23,7 @@ order_status_transitions_rejected_total = Counter(
 logger = structlog.get_logger()
 
 
-async def set_status(session: AsyncSession, event: Event, status: OrderStatus) -> Counter:
-    order_id = event.payload["order_id"]
+async def set_status(session: AsyncSession, order_id: int, status: OrderStatus) -> Counter:
     order = await session.get(Order, order_id, with_for_update=True)
     if order is None:
         logger.error("event for unknown order", order_id=order_id)
@@ -47,12 +46,12 @@ async def set_status(session: AsyncSession, event: Event, status: OrderStatus) -
 
 @idempotent
 async def on_inventory_rejected(session: AsyncSession, event: Event) -> Counter:
-    return await set_status(session, event, OrderStatus.rejected)
+    return await set_status(session, event.payload["order_id"], OrderStatus.rejected)
 
 
 @idempotent
 async def on_payment_completed(session: AsyncSession, event: Event) -> Counter:
-    return await set_status(session, event, OrderStatus.paid)
+    return await set_status(session, event.payload["order_id"], OrderStatus.paid)
 
 
 async def handle(

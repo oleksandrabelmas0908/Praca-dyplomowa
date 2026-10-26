@@ -1592,3 +1592,59 @@ Local Docker, one replica of each service:
   latency p50 8 ms, p95 26 ms, p99 314 ms. Stock totals unchanged.
 - After `docker pause` and `unpause`, Docker reported the container unhealthy and `make up` stopped
   on it until the container was restarted. That comes from the test, not from the services.
+
+## Flags wired through (TASK-34)
+
+### What changed
+
+| Flag | Before | Now |
+|---|---|---|
+| `UVICORN_WORKERS` | passed to catalog only, every other service ran one worker | passed to catalog, orders, inventory, payments and billing; the Dockerfile's `--workers ${UVICORN_WORKERS:-1}` was already there |
+| `KAFKA_PARTITIONS` | applied when `make up` creates a topic, `make up` failing on an existing topic with another count, broker auto-creation already off (`KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`) | the same, plus `make reset-topics` and `make reset` |
+| `CELERY_CONCURRENCY` | read by billing-worker (`worker_concurrency`) | unchanged. billing-worker is the only Celery worker since the image pipeline went |
+
+`UVICORN_WORKERS` is one value for every service. Each Uvicorn worker runs its own lifespan, so with
+4 workers orders has 8 consumers in group `orders`, and inventory and payments 4 each, which only
+helps up to `KAFKA_PARTITIONS`. The outbox pollers of all workers share the rows through
+`SKIP LOCKED` (TASK-12). The Prometheus caveat from TASK-23 now applies to every service: a scrape
+reaches one worker's registry. Memory with 4 workers, idle: billing 388 MiB of its 512 MiB, the
+others about 260 to 280 MiB. Database connections are opened on demand, but at most
+5 services × `UVICORN_WORKERS` × `DB_POOL_SIZE` (twice that for catalog and orders under
+`DB_DRIVER=sync`, which also keep the async engine) must stay under Postgres' 100.
+
+### Reset
+
+| Command | Does |
+|---|---|
+| `make reset-topics` | stops orders, inventory, payments and billing, deletes the four topics, waits until Kafka lists none of them, creates them with `KAFKA_PARTITIONS`, then starts the whole stack as `make up` does |
+| `make reset` | `make reset-topics`, `make seed`, and `TRUNCATE reservations` |
+
+`make reset` is the environment reset before every measured run, after `make up`. Events still on
+the topics are lost, and the consumer groups' committed offsets go with the deleted topics (the
+groups showed no current offset afterwards), so consumers start from the beginning of the new,
+empty topics. Outbox rows and `processed_events` stay.
+
+`reset-topics` ends by starting the whole stack rather than only the four services: a `make up`
+that fails on the partition count has already stopped before recreating any service, so without it
+the other flags changed in the same `.env` edit would stay unapplied. This happened in the first
+test run below.
+
+### Measured
+
+Local Docker, one replica of each service. Workers and Celery pool children counted in `/proc`
+inside each container, the driver from whether psycopg2's C extension is mapped into each Uvicorn
+worker, partitions from `kafka-topics.sh --describe`, the cache TTL from redis-cache after a product
+request:
+
+- `UVICORN_WORKERS=4`, `DB_DRIVER=sync`, `CACHE_TTL_SECONDS=30`, `CELERY_CONCURRENCY=2`,
+  `KAFKA_PARTITIONS=6`: `make up` stopped on `order.created exists with a partition count other than
+  KAFKA_PARTITIONS=6`. With `reset-topics` still starting only the four Kafka services, `make reset`
+  gave 6 partitions, but catalog kept 1 async worker and a 60 s TTL and billing-worker 5 children.
+  After the change above, `make reset` applied everything: 4 workers in each of the five services,
+  every catalog and orders worker sync, TTL 30, 6 partitions, 2 pool children. An order reached
+  `paid` with a completed invoice.
+- `UVICORN_WORKERS=2`, `DB_DRIVER=async`, `CACHE_ENABLED=false`, `TRANSPORT=http`,
+  `CELERY_CONCURRENCY=3`, `KAFKA_PARTITIONS=1`, through `make up` (stopped on the partition count) and
+  `make reset`: 2 workers per service, async, nothing cached, `POST /reservations` and
+  `POST /payments` answering 422, no members in groups `orders`, `inventory` and `payments`,
+  1 partition per topic, 3 pool children. An order answered `paid`.

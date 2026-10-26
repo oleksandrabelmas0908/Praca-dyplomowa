@@ -10,6 +10,21 @@ KAFKA_TOPICS = $(COMPOSE) exec -T -e KAFKA_HEAP_OPTS=-Xmx128m kafka \
 	/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092
 # Every topic a service publishes to
 TOPICS = order.created inventory.reserved inventory.rejected payment.completed
+# Services with a Kafka consumer or producer, stopped while the topics are recreated
+KAFKA_SERVICES = orders inventory payments billing
+
+# Creates any missing topic with KAFKA_PARTITIONS and fails on an existing one with another count
+define CREATE_TOPICS
+	@for topic in $(TOPICS); do \
+		$(KAFKA_TOPICS) --create --if-not-exists --topic $$topic \
+			--partitions $(KAFKA_PARTITIONS) --replication-factor 1 || exit 1; \
+		$(KAFKA_TOPICS) --describe --topic $$topic \
+			| grep -q "PartitionCount: $(KAFKA_PARTITIONS)[[:space:]]" || { \
+			echo "$$topic exists with a partition count other than KAFKA_PARTITIONS=$(KAFKA_PARTITIONS)," \
+				"recreate it with make reset-topics"; \
+			exit 1; }; \
+	done
+endef
 
 # Defaults for make test, override with e.g. make test REQUESTS=200 LIMIT=50
 REQUESTS ?= 100
@@ -17,24 +32,17 @@ LIMIT ?= 1000
 ORDERS ?= 20
 LINES ?= 3
 
-.PHONY: up down obs seed health lint test test-invoices
+.PHONY: up down obs seed reset reset-topics health lint test test-invoices
 
 # OBS=false leaves out infra/docker-compose.obs.yml and removes its containers if they are running.
 # Services start last, so the schema and the topics already exist when their consumers start.
 # An existing topic keeps its partition count, so a changed KAFKA_PARTITIONS fails here loudly
+# until make reset-topics recreates it
 up:
 	$(COMPOSE) build
 	$(COMPOSE) up -d --wait postgres kafka
 	$(COMPOSE) run --rm --build migrate
-	@for topic in $(TOPICS); do \
-		$(KAFKA_TOPICS) --create --if-not-exists --topic $$topic \
-			--partitions $(KAFKA_PARTITIONS) --replication-factor 1 || exit 1; \
-		$(KAFKA_TOPICS) --describe --topic $$topic \
-			| grep -q "PartitionCount: $(KAFKA_PARTITIONS)[[:space:]]" || { \
-			echo "$$topic exists with a partition count other than KAFKA_PARTITIONS=$(KAFKA_PARTITIONS)," \
-				"recreate it with a clean stack (docker compose down -v)"; \
-			exit 1; }; \
-	done
+	$(CREATE_TOPICS)
 	$(COMPOSE) up -d --wait --remove-orphans
 
 # Both files whatever OBS is, so monitoring containers and volumes go too
@@ -48,6 +56,21 @@ obs:
 # Replaces the whole catalogue, so it always ends with the same products
 seed:
 	$(COMPOSE) exec -T catalog python -m catalog.seed
+
+# Partition counts cannot change in place, so every topic is deleted and created again with the
+# current KAFKA_PARTITIONS. Events still on the topics are lost. Ends like make up, so the other
+# .env changes that a failed make up left unapplied take effect too
+reset-topics:
+	$(COMPOSE) stop $(KAFKA_SERVICES)
+	@for topic in $(TOPICS); do $(KAFKA_TOPICS) --delete --if-exists --topic $$topic || exit 1; done
+	@while $(KAFKA_TOPICS) --list | grep -qxF $(addprefix -e ,$(TOPICS)); do sleep 1; done
+	$(CREATE_TOPICS)
+	$(COMPOSE) up -d --wait --remove-orphans
+
+# Before every measured run, after make up: topics with the current KAFKA_PARTITIONS, stock
+# reseeded, and reservations emptied so they add up to stock_reserved again
+reset: reset-topics seed
+	$(COMPOSE) exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) -c "TRUNCATE reservations"
 
 health:
 	@curl -fsS localhost:$(CATALOG_PORT)/health && echo

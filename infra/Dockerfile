@@ -43,6 +43,5 @@ COPY ${SERVICE}/ ./${SERVICE}/
 
 EXPOSE 8000
 
-# Shell form, because expansion of $SERVICE is needed here. Only catalog sets UVICORN_WORKERS,
-# the other services run one worker
+# Shell form, because expansion of $SERVICE is needed here
 CMD exec uvicorn ${SERVICE}.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1}

@@ -1,0 +1,194 @@
+# Every configuration the experiments measure. Each entry sets every flag, so an entry is the
+# whole configuration and nothing is inherited from .env. An entry shared by several experiments
+# lists all of them.
+#
+# E1  DB driver x Uvicorn workers, cache off so catalog reads reach the database
+# E2  cache: off (e1-async-w1), TTL 10 s, TTL 60 s
+# E3  transport: kafka (e2-ttl-60), http
+# E4  Kafka partitions x inventory and payments replicas
+# E5  Celery concurrency of billing-worker
+#
+# DB_DRIVER=sync with TRANSPORT=http is not here: orders refuses to start with it (TASK-33).
+
+entries:
+  - name: e1-async-w1
+    experiments: [E1, E2]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e1-sync-w1
+    experiments: [E1]
+    flags:
+      DB_DRIVER: sync
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e1-async-w2
+    experiments: [E1]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 2
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e1-sync-w2
+    experiments: [E1]
+    flags:
+      DB_DRIVER: sync
+      UVICORN_WORKERS: 2
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e1-async-w4
+    experiments: [E1]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 4
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e1-sync-w4
+    experiments: [E1]
+    flags:
+      DB_DRIVER: sync
+      UVICORN_WORKERS: 4
+      CACHE_ENABLED: false
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e2-ttl-10
+    experiments: [E2]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 10
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e2-ttl-60
+    experiments: [E2, E3]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e3-http
+    experiments: [E3]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: http
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e4-p1-r1
+    experiments: [E4]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 1
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 2
+
+  - name: e4-p3-r3
+    experiments: [E4]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 3
+      PAYMENTS_REPLICAS: 3
+      CELERY_CONCURRENCY: 2
+
+  - name: e4-p6-r3
+    experiments: [E4]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 6
+      INVENTORY_REPLICAS: 3
+      PAYMENTS_REPLICAS: 3
+      CELERY_CONCURRENCY: 2
+
+  - name: e5-c1
+    experiments: [E5]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 1
+
+  - name: e5-c4
+    experiments: [E5]
+    flags:
+      DB_DRIVER: async
+      UVICORN_WORKERS: 1
+      CACHE_ENABLED: true
+      CACHE_TTL_SECONDS: 60
+      TRANSPORT: kafka
+      KAFKA_PARTITIONS: 3
+      INVENTORY_REPLICAS: 1
+      PAYMENTS_REPLICAS: 1
+      CELERY_CONCURRENCY: 4

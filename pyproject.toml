@@ -24,6 +24,8 @@ dependencies = [
 dev = [
     "ruff==0.16.8",
     "mypy==2.3.1",
+    # bench/ scripts read bench/matrix.yaml on the host
+    "pyyaml==6.0.3",
 ]
 
 [build-system]

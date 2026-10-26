@@ -1648,3 +1648,90 @@ request:
   `make reset`: 2 workers per service, async, nothing cached, `POST /reservations` and
   `POST /payments` answering 422, no members in groups `orders`, `inventory` and `payments`,
   1 partition per topic, 3 pool children. An order answered `paid`.
+
+## Configuration matrix and smoke test (TASK-35)
+
+### Matrix
+
+`bench/matrix.yaml` lists the 14 configurations the experiments measure, not the cartesian product
+of the flags. Each entry has a `name`, the `experiments` that use it, and `flags` with every flag
+the experiments vary, so an entry is a whole configuration and nothing is inherited from `.env`:
+
+| Experiment | Entries | Varies |
+|---|---|---|
+| E1 driver × workers | `e1-{async,sync}-w{1,2,4}` | `DB_DRIVER`, `UVICORN_WORKERS`, cache off |
+| E2 cache | `e1-async-w1` (off), `e2-ttl-10`, `e2-ttl-60` | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` |
+| E3 transport | `e2-ttl-60` (kafka), `e3-http` | `TRANSPORT` |
+| E4 partitions × replicas | `e4-p1-r1`, `e4-p3-r3`, `e4-p6-r3` | `KAFKA_PARTITIONS`, `INVENTORY_REPLICAS`, `PAYMENTS_REPLICAS` |
+| E5 Celery | `e5-c1`, `e5-c4` | `CELERY_CONCURRENCY` |
+
+The flags no experiment varies keep the baseline: async, 1 worker, cache on with TTL 60, kafka,
+3 partitions, 1 replica of inventory and payments, concurrency 2. `DB_DRIVER=sync` with
+`TRANSPORT=http` is not in the matrix, because orders refuses to start with it (TASK-33). The same
+file is what the benchmark harness will iterate over. PyYAML 6.0.3 is in the dev extras for it and
+is installed on the host (`pip install pyyaml`), where the bench scripts run.
+
+### Smoke test
+
+`make smoke` (`bench/smoke.py`), or `make smoke ENTRY=<name>` for one entry. Per entry:
+
+1. write the entry's flags into `.env`
+2. `docker compose down -v --remove-orphans`, both Compose files
+3. `make up OBS=false`, 300 s timeout. It starts Postgres and Kafka, runs the migrations, creates the
+   topics with the entry's partition count and then starts the services, so the schema and topics
+   exist before any consumer starts (topic auto-creation is off). The ticket's order, `up -d` and
+   then migrations, would start consumers on topics that do not exist yet. The monitoring stack is
+   left out to keep an entry short.
+4. poll `docker compose ps --all` every second until every container is healthy, 120 s timeout. A
+   container that has exited fails the entry at once with its name and exit code.
+5. `make seed`, keeping the `stock_total` it logs
+6. check every flag against the running containers (below)
+7. one order of 1 unit of the lowest-ID product with stock, which must end `paid`, and one of the
+   lowest-ID product with none, which must end `rejected`. Under `kafka` the response must say
+   `pending` and the order is polled every 0.2 s until it leaves `pending`, 30 s timeout. Under
+   `http` the response itself must carry the final status, and nothing is polled.
+8. `sum(stock_quantity + stock_reserved)` must equal `stock_total`, and no product may be negative
+9. in a `finally`, `docker compose down -v --remove-orphans`
+
+Every docker call has a timeout (120 s, 300 s for `make up`), and the HTTP calls 10 s, so a dead
+container fails the entry instead of hanging it. Any exception fails only its entry: the reason is
+recorded, `docker compose logs --timestamps` goes to `bench/results/smoke/<entry>.log` with the
+reason and traceback at the top, before the teardown, and the loop goes on. The run ends with a
+table of entry, result, duration and reason, and exits 1 if any entry failed. `.env` is restored
+when the run ends, also after Ctrl-C.
+
+The flag checks are the ones TASK-34's script made, now inside the smoke test: Uvicorn workers and
+Celery pool children counted in `/proc` of every container, the driver from whether psycopg2's C
+extension is mapped into each catalog and orders worker, the cache TTL of a product key in
+redis-cache after a request, the transport from `POST /reservations` and `POST /payments` (404 under
+`kafka`, 422 under `http`) and from the members of groups `orders`, `inventory` and `payments`, the
+partition count of the four topics, and the number of inventory and payments containers. Any
+mismatch fails the entry before an order is placed, naming the flag and what was observed.
+
+`make smoke` runs with the variables `make` exported from the original `.env`. The script drops
+them, and `MAKEFLAGS`, from the environment of its own commands, because Compose prefers shell
+variables over `.env` and would otherwise boot the old values.
+
+Two runs at once destroy each other's containers, since both use the same project name: run one
+at a time, and not while working on the stack. A run leaves the stack down with empty volumes, so
+`make up` comes next, not `make reset`, which expects migrated tables.
+
+### Measured
+
+Local Docker:
+
+- The whole matrix, twice, the second time after the failure-path changes below: 14 of 14 passed
+  both times, in 507 s and 509 s, 31 to 40 s per entry (`e3-http` fastest, the `w2` and `w4`
+  entries slowest).
+- An entry with `DB_DRIVER: banana` placed before `e3-http`: failed in 23 s with
+  `make up OBS=false exited 2: container pracadyplomowa-catalog-1 exited (1)`, the log file
+  containing pydantic's `Input should be 'async' or 'sync' ... input_value='banana'`. `e3-http`
+  passed afterwards, and the run exited 1.
+- Kafka killed 2 s after orders turned healthy: failed in 30 s with `no running kafka container`.
+  The first attempt reported `IndexError('list index out of range')` instead, because the script
+  took the first of an empty container list; it now names the stopped service.
+- orders killed at its first `POST /orders`: failed in 33 s with `GET
+  http://localhost:8002/orders/1: [Errno 61] Connection refused`.
+- payments paused at the first `POST /orders`: failed in 64 s with `order 1 still pending after
+  30 s`, and the teardown removed the paused container.
+- After every one of these, no container was left and `.env` was identical to before the run.

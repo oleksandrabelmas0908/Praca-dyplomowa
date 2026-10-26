@@ -31,8 +31,10 @@ REQUESTS ?= 100
 LIMIT ?= 1000
 ORDERS ?= 20
 LINES ?= 3
+# One entry of bench/matrix.yaml for make smoke, all of them when empty
+ENTRY ?=
 
-.PHONY: up down obs seed reset reset-topics health lint test test-invoices
+.PHONY: up down obs seed reset reset-topics smoke health lint test test-invoices
 
 # OBS=false leaves out infra/docker-compose.obs.yml and removes its containers if they are running.
 # Services start last, so the schema and the topics already exist when their consumers start.
@@ -71,6 +73,11 @@ reset-topics:
 # reseeded, and reservations emptied so they add up to stock_reserved again
 reset: reset-topics seed
 	$(COMPOSE) exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) -c "TRUNCATE reservations"
+
+# Boots every configuration in bench/matrix.yaml in turn and runs orders through it. Rewrites .env
+# while it runs and restores it, and leaves the stack down, volumes included
+smoke:
+	python3 bench/smoke.py $(ENTRY)
 
 health:
 	@curl -fsS localhost:$(CATALOG_PORT)/health && echo
